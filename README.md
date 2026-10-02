@@ -13,7 +13,9 @@
 - **长驻会话**：每个宿主 session id 对应一个 warm 内层 `query()` 子进程，对话延续、工具轮次都发生在会话内部；`maxSessions` 上限内按插入序 LRU 淘汰。
 - **工具桥接**：宿主工具通过进程内 MCP server（`dsh-host`）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对（120s 内未回传则超时取消）。
 - **模型目录**：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享 + 超时保护，失败回退静态目录；另提供 `deepseek-v4-flash` → `dfmodel`、`deepseek-v4-pro` → `dmodel` 别名。
-- **思考强度与上下文窗口**：`resolveModel` 上报 CLI 的 reasoning efforts、默认档位与 `availableContextWindows` / `defaultContextWindow`，模型选择器可直接切换；所选值随每次请求下发。
+- **思考强度**：`resolveModel` 上报 CLI 的 reasoning efforts 与默认档位，模型选择器可直接切换；所选值随每次请求下发给内层会话。
+- **上下文窗口**：`resolveModel` 只上报请求实际使用的窗口（`LlmModelContext` 在当前接缝里只有 `contextWindow` 一个字段），compaction 阈值与上下文环的分母因此和内层真实窗口一致。
+- **视觉输入**：模型目录里 CLI 明确标记 `isVl: true` 的模型才广告 `image` modality；这类模型下，本轮新上传的图片与工具结果里的图片会以 base64 转发给内层 CLI。历史图片与文本模型仍走 harness 的占位文本，不会把像素重复计入每次请求。
 - **旁路请求**：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。
 - **溢出可恢复**：内层模型因上下文超限失败时（如 `maximum context length ... you requested N tokens`），按 dsh-llm 的 `isContextWindowExceededError` 分类为 `CONTEXT_WINDOW_EXCEEDED` 上报，harness 的溢出自动恢复（配合 `compaction-basic`）可以接管而不是让轮次直接报废。
 
@@ -40,9 +42,9 @@ harness 通过 `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` 注�
 ### 2. 会话模型适配
 
 - **一宿主会话对应一 warm qodercli 会话**：`QoderSessionManager` 以宿主 `sessionId` 为键维护 `query()` 子进程，超出 `maxSessions` 按插入序 LRU 淘汰。
-- **增量 feed**：宿主每次请求携带完整消息列表，插件通过 `planContinuation` 对比上一次，只把新用户轮次与改写消息渲染成纯文本 feed；工具结果不进入文本 feed（走 MCP）。
+- **增量 feed**：宿主每次请求携带完整消息列表，插件通过 `planContinuation` 对比上一次，只把新用户轮次与改写消息渲染成 feed；工具结果不进入 feed（走 MCP）。feed 默认是纯文本，只有本轮带图片且模型广告了 `image` 时才变成"文本 + 图片"块。
 - **重建检测**：当宿主 surface 被改写（例如 compaction 折叠了历史）导致消息数变少或结构变化，`planContinuation` 返回 `rebuild: true`，插件 dispose 旧 warm 会话并按新 surface 冷启动。**这保证了 dsh 侧的压缩与 qodercli 内部缓存不会产生双份状态**。
-- **模型切换**：`setModel` 把 `reasoningEffort` / `contextWindow` 作为 model-policy 参数传给内层会话。
+- **模型切换**：`setModel` 把 `reasoningEffort` 作为 model-policy 参数传给内层会话。当前接缝的 `GenerateOptions` 不带 per-request 窗口，内层会话因此始终运行在 CLI 自己的默认窗口上，与 `resolveModel` 上报的值同源。
 
 ### 3. 工具桥接适配（MCP）
 
@@ -78,8 +80,14 @@ contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTE
 ```
 
 - 取 `defaultContextWindow`（实际窗口，如 200K）→ 阈值 = 160K，与 provider 真实能力对齐；
-- `maxInputTokens`（上限，如 1M）只保留在 `availableContextWindows` 里供选择器切换；
-- 若误用上限，阈值会被放大（如 800K），压缩永远不会在 provider 拒绝前触发。
+- 若误用上限，阈值会被放大（如 800K），压缩永远不会在 provider 拒绝前触发；
+- 当前接缝的 `LlmModelContext` 只有 `contextWindow` 一个字段，CLI 的可选档位不再随元数据下发（选择器无法切换窗口，只能由 CLI 自己决定）。
+
+### 4.5 派发代次的绑定（`prepareCall`）
+
+harness 先 `prepareCall(provider, model, signal)` 绑定"这一次调用的模型元数据"，再在稍后派发流式请求（`dsh-agent-loop` 用的就是这条路径）。插件覆写它，把解析结果与由它推导出的能力（是否视觉模型）一起钉在同一代次上：即使 CLI 目录或登录态在 prepare 与 stream 之间发生变化，这一轮也不会把"上一代的能力"接到"下一代的端点"上。
+
+**这也是 `registration.adapter.prepareCall is not a function` 的根治点**：该方法是 dsh-llm 0.1.1-rc.2 起 `LlmAdapter` 基类新增的具体方法，插件必须编译/安装在一个含该方法的 dsh-llm 上，否则运行时会直接炸（见 issue #2）。
 
 ### 6. 上下文占用计量的适配
 
@@ -118,25 +126,50 @@ function classifyTurnError(detail: string): string {
 - **无冲突保证**：dsh 压缩改写 surface 后，插件 `planContinuation` 检测到消息结构变化（`rebuild: true`），主动重建 warm 会话。qodercli 内部缓存随 dsh 压缩被作废，**不存在"两边各压一遍"**。
 - 摘要生成默认走主会话路由；需要绕开特定 provider 配额时，可在 `cordis.patch.yml` 给 compaction-basic 配置 `summarizationProvider` / `summarizationModel` 指向其它有额度的模型。
 
+## 兼容性
+
+| dsh 运行时 | 是否可用 | 说明 |
+| --- | --- | --- |
+| `0.1.7-rc.1` ~ `0.2.x` | ✅ | 本仓库编译并测试在这一代接缝上（`@deepseek-ai/dsh-llm` 的 `RequestMessage` / `role: 'tool'` 工具结果 / `ToolCallId` / `prepareCall`） |
+| `0.1.1-rc.2` ~ `0.1.2-rc.1` | ❌ | 工具结果还是 `tool-result` 内容块、品牌函数还叫 `CallId`，且 `GenerateOptions` 里没有 `contextWindow`；类型与运行时都不匹配 |
+| `0.1.0-rc.x` | ❌ | 该基类没有 `prepareCall`，选中 qoder 路由后一发消息就报 `registration.adapter.prepareCall is not a function`（issue #2） |
+
+peer 范围写死为 `^0.1.7-rc.1 || ^0.2.0-rc.1`，不用 `^0.1.0-rc.5` 这类跨元组写法：npm 的 semver 对 prerelease 只在同 `[major,minor,patch]` 元组内匹配，旧范围既匹配不到修复版，也会被 dsh 的 profile 安装器判定为与运行时不兼容而拒绝安装。
+
 ## 安装
 
 前置条件：本机已安装并登录 qodercli（`qodercli --version` 可运行）。插件完全复用 qodercli 登录态，不需要 API key 或 settings 段。
 
-### 从发布包引入
+### 渠道一：Git 直装（无需本地构建）
 
-1. 获取插件包：从本仓库 Releases 下载最新的 `jiamingzang-dsh-llm-qoder-<version>.tgz`（或在仓库根目录 `pnpm pack` 自行生成）；
-2. 添加到目标 profile：
+```sh
+dsh plugin --profile <profile> add git+https://github.com/JiamingZang/dsh-llm-qodersdk.git
+```
 
-   ```sh
-   dsh plugin --profile <profile> add jiamingzang-dsh-llm-qoder-<version>.tgz
-   ```
+仓库里**已提交构建产物** `lib/index.js` 与 `lib/types/*.d.ts`，所以这条路径不需要 pnpm 运行插件自己的 `prepare` 脚本（在新 pnpm 上，未批准的 `prepare` 会直接硬失败 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，而不是安静跳过）。
 
-3. **首次安装需批准构建脚本**：`@qoder-ai/qoder-agent-sdk` 带 postinstall（下载 worker runtime），pnpm 11+ 默认拦截并报 `ERR_PNPM_IGNORED_BUILDS`。dsh 会把待批准 key 写入 profile 的 `pnpm-workspace.yaml` 占位（`allowBuilds` 下 `'@qoder-ai/qoder-agent-sdk': set this to true or false`），把值改为 `true` 后重跑上面的 add 命令即完成安装——这是 dsh 对任何带 postinstall 依赖的标准 fail-loud 流程；
-4. 验证：`dsh --profile <profile> --dump-config | grep llm-qoder` 应出现插件条目；重启服务后模型选择器出现 `qoder` / `qoder-byok`。
+仍需批准 **`@qoder-ai/qoder-agent-sdk` 的 postinstall**——它负责下载内层使用的 `qodercli` 二进制，跳过会导致插件加载后无法启动内层会话：
 
-### 手动挂载（可选）
+- 安装被拦时，按提示把 profile `~/.dsh/profiles/<profile>/pnpm-workspace.yaml` 里 `allowBuilds` 下对应键的值改为 `true`，重跑上面的 add；
+- 也可以在 dsh Web 界面的插件构建审批里点确认；
+- 如果你本机已经有可用的 `qodercli`（或设置了 `QODERCLI_PATH`），可以跳过该下载，但必须自行保证 SDK 找得到可执行文件。
 
-不经过 plugin 命令时，可在 cordis.yml 或 patch 层直接声明（插件 package.json 也声明了 `dsh.bundle`，plugin add 后会自动进 profile 的 bundles）：
+### 渠道二：本地包（tgz / 目录）
+
+```sh
+dsh plugin --profile <profile> add ./jiamingzang-dsh-llm-qoder-<version>.tgz
+```
+
+`pnpm pack` 产出的包已含 `lib/`，与渠道一同样的构建脚本批准流程。
+
+### 渠道三：npm
+
+`@jiamingzang/dsh-llm-qoder` 目前尚未发布到 npm（`npm view` 返回 404）。发布后 `dsh plugin add @jiamingzang/dsh-llm-qoder` 即为最省事的路径；在此之前请用上面两个渠道之一。
+
+### 验证与手动挂载
+
+- 验证：`dsh --profile <profile> --dump-config | grep llm-qoder` 应出现插件条目；服务启动后模型选择器出现 `Qoder CLI` / `Qoder 自定义` 两个分组（首次启动 >10s 属正常）。
+- 不经过 plugin 命令时，可在 cordis.yml 或 patch 层直接声明（插件 package.json 也声明了 `dsh.bundle`，plugin add 后会自动进 profile 的 bundles）：
 
 ```yaml
 - id: llm-qoder
@@ -145,15 +178,21 @@ function classifyTurnError(detail: string): string {
 
 ### 使用与排障
 
-- 在对话框模型选择器或 Models 设置页选择 `qoder`（账号内置）或 `qoder-byok`（账号自定义）下的模型；上下文窗口与思考档位可在模型面板切换。
-- **看不到自定义模型或窗口调节消失**：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 `isEnabled: false`）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。
+- 在对话框模型选择器或 Models 设置页选择 `Qoder CLI`（账号内置）或 `Qoder 自定义`（账号自定义）下的模型；思考档位可在模型面板切换。
+- **看不到自定义模型**：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 `isEnabled: false`）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。
+- **图片发过去模型看不到**：只有 live catalog 标记 `isVl: true` 的模型会广告图像输入；其余模型下宿主会把图片投影成占位文本，插件不会伪造视觉能力。
+- **装完但选不到模型**：确认 profile 的 pnpm 构建审批里 `@qoder-ai/qoder-agent-sdk` 为 `true`（其 postinstall 下载内层 CLI），并检查 `qodercli` 可执行。
 
 ## 配置
+
+配置项就是插件 profile 条目的 `Config`（设置页由 dsh-settings 直接投影该 schema，插件不再自己注册命名空间）：
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | 同时保持 warm 的内层 qodercli 会话上限（超出按插入序 LRU 淘汰） |
 | `modelCacheTtlSeconds` | number | `300` | CLI 模型目录的缓存保鲜秒数 |
+
+改配置后由 profile 载入器重新 `apply()`：新适配器接管路由，旧适配器的 warm 会话随 effect 关闭。
 
 ## 上下文管理与压缩
 
@@ -179,29 +218,30 @@ warm 内层会话会累积整段宿主历史：首轮喂入全量历史（`rende
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口：`ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` |
-| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成，warm 会话管理、续轮规划、side-channel 模型传递、请求输入估算 |
+| `src/index.ts` | 插件入口：`ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)`；用 `ctx.inject(['attachments'])` 软依赖宿主附件存储（未挂载则图片降级为占位文本） |
+| `src/adapter.ts` | `QoderAdapter`：模型列表/解析/流式生成、`prepareCall` 代次绑定、视觉能力判定与图片字节解析、warm 会话管理、续轮规划、side-channel 模型传递、请求输入估算 |
 | `src/session.ts` | `QoderSession`：内层 `query()` 子进程、MCP 工具桥、SDK 流事件 → harness `StreamChunk`、usage 上报（真实输入估算 + 错误分类） |
-| `src/models.ts` | 实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退） |
-| `src/catalog.ts` | 静态模型表与 `deepseek-v4-*` 别名 |
-| `src/render.ts` | 宿主消息 → 内层纯文本 feed；身份覆盖 |
+| `src/models.ts` | 实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退），并带出 CLI 的 `isVl` |
+| `src/catalog.ts` | 静态模型表与 `deepseek-v4-*` 别名（静态表一律不广告视觉能力） |
+| `src/render.ts` | 宿主消息 → 内层 feed：纯文本或"文本 + 图片引用"部分；身份覆盖 |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape（MCP 工具注册用） |
 
 ## 开发与构建
 
-本仓库只存源码（`src/`）与测试（`tests/`）；构建产物 `lib/`（`lib/index.js` + `lib/types/*.d.ts`）被 `.gitignore` 忽略，由构建脚本按需生成。
+本仓库的发布物是**入库的构建产物**：`lib/index.js`（tsdown 打包）与 `lib/types/*.d.ts`（tsc 声明）。改完 `src/` 必须连同 `lib/` 一起提交，否则 Git 直装的用户拿到的仍是旧 bundle。
 
 ```sh
 pnpm install
-pnpm test        # vitest 单元测试
-pnpm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
-pnpm pack        # 生成 jiamingzang-dsh-llm-qoder-<version>.tgz
-pnpm publish     # prepublishOnly 自动先构建
+pnpm run typecheck   # tsc 类型检查 src + tests（vitest 不做类型检查）
+pnpm test            # vitest 单元测试
+pnpm run build       # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
+pnpm pack            # 生成 jiamingzang-dsh-llm-qoder-<version>.tgz
+pnpm publish         # prepublishOnly 自动先构建
 ```
 
-构建配置已就位（`tsconfig.json` + `tsdown.config.ts`），peer 依赖 `@deepseek-ai/dsh-llm` 和 `@deepseek-ai/cordis` 保持 external。
+`@deepseek-ai/dsh-llm`、`@deepseek-ai/cordis`、`@deepseek-ai/schemastery` 在 `tsdown.config.ts` 里保持 external，由运行时 profile 提供；`@deepseek-ai/dsh-attachment` 只在 devDependencies 里提供类型（附件存储的实例来自宿主）。
 
-> **版本说明**：peer 依赖 `@deepseek-ai/dsh-llm@^0.1.0-rc.5` 已可从公共 npm 解析（当前最新为 `0.1.0-rc.6`），本仓库可直接 `pnpm install && pnpm run build`。若需与 DeepSeek Harness 主仓库内的本地版本（`0.1.0-rc.5`）完全对齐，可在主仓库 `plugins/llm-qoder/` 目录内构建（由仓库根 `tsc` + `tsdown` 产出 `lib/`）。
+> **为什么依赖要钉死**：曾用的 `^0.1.0-rc.5` 因 semver 的 prerelease 元组规则永远匹配不到 `0.1.1-rc.x`/`0.1.7-rc.x`，插件会编译进一个没有 `prepareCall` 的 `LlmAdapter` 基类；`pnpm update` 也修不出来，只能显式改 manifest（issue #2）。同时 dsh 的 profile 安装器会把 `@deepseek-ai/dsh-*` 的 peer 范围与运行时版本比对，范围过窄会直接拒绝安装。
 
 ## License
 
