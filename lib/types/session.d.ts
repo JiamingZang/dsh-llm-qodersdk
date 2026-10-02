@@ -11,12 +11,6 @@ import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSc
 /** MCP server name this adapter exposes host tools under. */
 export declare const MCP_SERVER_NAME = "dsh-host";
 /**
- * Characters charged for one forwarded image when estimating request input.
- * The inner CLI reports no usage for vision payloads, so an image's base64
- * request size is the only measurable proxy of the capacity it consumes.
- */
-export declare const IMAGE_ESTIMATED_CHARS = 1024000;
-/**
  * One user-turn content block on the streaming-input channel. Text is the
  * historical shape; image blocks use the SDK's Claude-compatible base64
  * vision shape (`ImageContentBlock`).
@@ -197,6 +191,14 @@ export declare class QoderSession {
  * else is serialized.
  */
 export declare function renderResultContent(blocks: readonly ContentBlock[], images?: ResolvedImages): McpContent[];
+/**
+ * Vision tokens for one image, estimated with the tile formula the
+ * Claude-compatible wire shape this backend follows uses (width x height / 750).
+ * The inner CLI reports no usage for the pixels it consumed, so this estimate is
+ * the only image occupancy the harness context meter and compaction threshold
+ * can see. It is an estimate, not a provider metering figure.
+ */
+export declare function estimateImageTokens(width: number, height: number): number;
 /** Safely stringify the SDK error payload for turn diagnostics. */
 export declare function safeErrors(errors: unknown): string;
 /**

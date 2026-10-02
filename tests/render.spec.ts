@@ -7,7 +7,7 @@ import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
-  blockParts, currentTurnStart, feedImageRefs, feedLength, feedToText, imageRefs,
+  blockParts, currentTurnStart, feedImageRefs, feedTextLength, feedToText, imageRefs,
   joinFeeds, renderBlocks, renderIdentityAppend, renderInitialFeed, renderMessage, renderRefreshed,
   renderSystemUpdate, renderUserTurn,
 } from '../src/render.ts'
@@ -188,13 +188,13 @@ describe('feed composition', () => {
     expect(imageRefs([text('t'), imageBlock('i2')])).toHaveLength(1)
   })
 
-  it('charges images a fixed character budget when estimating', () => {
+  it('counts only literal characters in a feed', () => {
     const feed: ReturnType<typeof blockParts> = [
       { type: 'text', text: 'abc' },
       { type: 'image', attachment: image('i1') },
     ]
-    expect(feedLength('abc', 100)).toBe(3)
-    expect(feedLength(feed, 100)).toBe(103)
+    expect(feedTextLength('abc')).toBe(3)
+    expect(feedTextLength(feed)).toBe(3)
   })
 })
 

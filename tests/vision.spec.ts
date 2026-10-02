@@ -75,7 +75,6 @@ vi.mock('../src/session.ts', () => {
         return { done: true, value: undefined } as never
       }
     },
-    IMAGE_ESTIMATED_CHARS: 1_048_576,
   }
 })
 

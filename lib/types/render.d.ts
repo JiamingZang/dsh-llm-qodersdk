@@ -52,12 +52,8 @@ export declare function currentTurnStart(messages: readonly RequestMessage[]): n
 export declare function feedImageRefs(feed: Feed): ImageAttachmentRef[];
 /** Flatten a feed back to text, replacing images with the harness handle text. */
 export declare function feedToText(feed: Feed): string;
-/**
- * Characters a feed is charged at for context accounting: literal text plus
- * {@link imageChars} for every image, because the inner CLI reports no usage
- * for the pixels it consumes.
- */
-export declare function feedLength(feed: Feed, imageChars: number): number;
+/** Literal characters in a feed; images contribute their pixels, not text. */
+export declare function feedTextLength(feed: Feed): number;
 /**
  * Compose the first feed for a fresh session: backend role, the host system
  * prompt, and the existing conversation as compact context. Messages of the

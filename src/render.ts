@@ -162,14 +162,10 @@ export function feedToText(feed: Feed): string {
     .join('\n\n')
 }
 
-/**
- * Characters a feed is charged at for context accounting: literal text plus
- * {@link imageChars} for every image, because the inner CLI reports no usage
- * for the pixels it consumes.
- */
-export function feedLength(feed: Feed, imageChars: number): number {
+/** Literal characters in a feed; images contribute their pixels, not text. */
+export function feedTextLength(feed: Feed): number {
   if (typeof feed === 'string') return feed.length
-  return feed.reduce((total, part) => total + (part.type === 'text' ? part.text.length : imageChars), 0)
+  return feed.reduce((total, part) => total + (part.type === 'text' ? part.text.length : 0), 0)
 }
 
 /**

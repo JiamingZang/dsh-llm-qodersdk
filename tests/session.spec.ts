@@ -15,7 +15,7 @@ import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
   QoderSession, QoderSessionManager, classifyTurnError, gateTools, hostToolName,
-  renderResultContent, safeErrors,
+  estimateImageTokens, renderResultContent, safeErrors,
 } from '../src/session.ts'
 
 const { mockQueryFactory, mockMcpServer } = vi.hoisted(() => {
@@ -224,6 +224,18 @@ describe('classifyTurnError', () => {
 
   it('falls back to the generic turn error', () => {
     expect(classifyTurnError('error something unrelated')).toBe('BACKEND_TURN_ERROR')
+  })
+})
+
+describe('estimateImageTokens', () => {
+  it('prices a forwarded image by its tile area', () => {
+    expect(estimateImageTokens(1500, 1000)).toBe(2000)
+    expect(estimateImageTokens(40, 30)).toBe(2)
+  })
+
+  it('keeps a floor of one token for unknown dimensions', () => {
+    expect(estimateImageTokens(0, 512)).toBe(1)
+    expect(estimateImageTokens(Number.NaN, 512)).toBe(1)
   })
 })
 

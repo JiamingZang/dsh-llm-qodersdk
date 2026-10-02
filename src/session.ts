@@ -19,7 +19,7 @@ import type {
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
-import { feedLength, renderInitialFeed } from './render.ts'
+import { feedImageRefs, feedTextLength, renderInitialFeed } from './render.ts'
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -28,13 +28,6 @@ const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 
 /** How long an MCP tool handler waits for the host tool result before failing the call. */
 const TOOL_RESULT_TIMEOUT_MS = 120_000
-
-/**
- * Characters charged for one forwarded image when estimating request input.
- * The inner CLI reports no usage for vision payloads, so an image's base64
- * request size is the only measurable proxy of the capacity it consumes.
- */
-export const IMAGE_ESTIMATED_CHARS = 1_024_000
 
 /**
  * One user-turn content block on the streaming-input channel. Text is the
@@ -572,7 +565,9 @@ export class QoderSession {
    */
   recordRequestInput(system: string | undefined, messages: readonly RequestMessage[]): void {
     const rendered = renderInitialFeed(system, messages)
-    this.estimatedInputTokens = Math.max(1, Math.ceil(feedLength(rendered, IMAGE_ESTIMATED_CHARS) / 4))
+    const imageTokens = feedImageRefs(rendered)
+      .reduce((total, ref) => total + estimateImageTokens(ref.width, ref.height), 0)
+    this.estimatedInputTokens = Math.max(1, Math.ceil(feedTextLength(rendered) / 4) + imageTokens)
   }
 
   private endTurn(reason: FinishReason, usage?: TokenUsage): void {
@@ -772,9 +767,21 @@ export function renderResultContent(blocks: readonly ContentBlock[], images?: Re
   return content
 }
 
-/** Characters one channel content list is charged at for context accounting. */
+/**
+ * Vision tokens for one image, estimated with the tile formula the
+ * Claude-compatible wire shape this backend follows uses (width x height / 750).
+ * The inner CLI reports no usage for the pixels it consumed, so this estimate is
+ * the only image occupancy the harness context meter and compaction threshold
+ * can see. It is an estimate, not a provider metering figure.
+ */
+export function estimateImageTokens(width: number, height: number): number {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1
+  return Math.max(1, Math.ceil((width * height) / 750))
+}
+
+/** Literal characters one channel content list contributes to the fallback estimate. */
 function contentChars(content: readonly ChannelContent[]): number {
-  return content.reduce((total, block) => total + (block.type === 'text' ? block.text.length : IMAGE_ESTIMATED_CHARS), 0)
+  return content.reduce((total, block) => total + (block.type === 'text' ? block.text.length : 0), 0)
 }
 
 /** Safely stringify the SDK error payload for turn diagnostics. */
