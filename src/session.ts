@@ -8,17 +8,18 @@
  * @module dsh-llm-qoder/session
  */
 
+import { randomUUID } from 'node:crypto'
 import {
-  CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, QUOTA_EXCEEDED_CODE,
-  isContextWindowExceededError, isQuotaExceededError,
+  CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, QUOTA_EXCEEDED_CODE, ToolCallId,
+  isContextWindowExceededError, isQuotaExceededError, textOnlyImageText,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk, ToolSchema, TokenUsage,
+  ContentBlock, FinishReason, GenerateOptions, RequestMessage, StreamChunk, ToolSchema, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { createSdkMcpServer, qodercliAuth, query } from '@qoder-ai/qoder-agent-sdk'
 import type { CanUseTool, Query } from '@qoder-ai/qoder-agent-sdk'
 import { jsonSchemaToShape } from './jsonschema.ts'
-import { renderInitialFeed } from './render.ts'
+import { feedLength, renderInitialFeed } from './render.ts'
 
 /** MCP server name this adapter exposes host tools under. */
 export const MCP_SERVER_NAME = 'dsh-host'
@@ -28,9 +29,42 @@ const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 /** How long an MCP tool handler waits for the host tool result before failing the call. */
 const TOOL_RESULT_TIMEOUT_MS = 120_000
 
+/**
+ * Characters charged for one forwarded image when estimating request input.
+ * The inner CLI reports no usage for vision payloads, so an image's base64
+ * request size is the only measurable proxy of the capacity it consumes.
+ */
+export const IMAGE_ESTIMATED_CHARS = 1_024_000
+
+/**
+ * One user-turn content block on the streaming-input channel. Text is the
+ * historical shape; image blocks use the SDK's Claude-compatible base64
+ * vision shape (`ImageContentBlock`).
+ */
+export type ChannelContent =
+  | { type: 'text', text: string }
+  | { type: 'image', source: { type: 'base64', media_type: string, data: string } }
+
+/** One MCP tool-result content block: text, or the MCP image shape. */
+export type McpContent =
+  | { type: 'text', text: string }
+  | { type: 'image', data: string, mimeType: string }
+
+/** A host tool result delivered to a parked or buffered MCP handler. */
+export interface ToolResultPayload {
+  content: McpContent[]
+  isError: boolean
+}
+
+/**
+ * Request-image bytes resolved by the adapter, keyed by attachment id. An id
+ * missing from the map degrades to handle text instead of failing the turn.
+ */
+export type ResolvedImages = ReadonlyMap<string, { data: string, mediaType: string }>
+
 interface ChannelMessage {
   type: 'user'
-  message: { role: 'user', content: Array<{ type: 'text', text: string }> }
+  message: { role: 'user', content: ChannelContent[] }
   parent_tool_use_id: null
 }
 
@@ -107,7 +141,7 @@ class TurnQueue implements AsyncIterable<QueueItem> {
   }
 }
 
-interface ParkedResolver { (result: { text: string, isError: boolean }): void }
+interface ParkedResolver { (result: ToolResultPayload): void }
 
 /** One tool-use block under assembly in the active turn. */
 interface ToolUnderAssembly {
@@ -188,7 +222,7 @@ export class QoderSession {
    * slot. Results buffer by tool-use id until their handler fires.
    */
   private readonly parked = new Map<string, ParkedResolver>()
-  private readonly pendingResults = new Map<string, { text: string, isError: boolean }>()
+  private readonly pendingResults = new Map<string, ToolResultPayload>()
   /** qodercli tool-use ids in canUseTool (execution) order, claimed by MCP handlers. */
   private readonly toolUseQueue: string[] = []
   /** Host callId (qoder-N) → qodercli tool-use id, from the content-block ids. */
@@ -200,10 +234,17 @@ export class QoderSession {
   private reasoningEffort: string | undefined
   private contextWindow: number | undefined
   private callCounter = 0
+  /**
+   * Per-instance suffix for emitted host call ids. Ids must stay unique across
+   * the whole host session log: a history divergence rebuilds this class, LRU
+   * eviction recreates it, and the harness keys tool-call blocks by id, so a
+   * fresh `qoder-1` would collide with the one its predecessor already stored.
+   */
+  private readonly callNonce = randomUUID().slice(0, 8)
   private abortPending = false
   private disposed = false
   /** Previous request's messages for delta feeding. */
-  fedMessages: readonly Message[] | undefined
+  fedMessages: readonly RequestMessage[] | undefined
   fedSystem: string | undefined
   /** This turn's fed characters, reset per turn for per-call token accounting. */
   turnInputChars = 0
@@ -320,12 +361,12 @@ export class QoderSession {
         this.mcp.instance.registerTool(schema.name, {
           description: schema.description.length > 0 ? schema.description : schema.name,
           inputSchema: shape,
-        }, async (args: unknown): Promise<{ content: Array<{ type: 'text', text: string }>, isError?: boolean }> => {
+        }, async (args: unknown): Promise<{ content: McpContent[], isError?: boolean }> => {
           void args
           const toolUseId = this.toolUseQueue.shift()
-          let result: { text: string, isError: boolean }
+          let result: ToolResultPayload
           if (toolUseId !== undefined && this.pendingResults.has(toolUseId)) {
-            result = this.pendingResults.get(toolUseId) as { text: string, isError: boolean }
+            result = this.pendingResults.get(toolUseId) as ToolResultPayload
             this.pendingResults.delete(toolUseId)
           } else {
             const key = toolUseId ?? `anon-${this.callCounter}-${this.parked.size}`
@@ -333,11 +374,14 @@ export class QoderSession {
             // leave the inner process waiting forever. On timeout the call
             // fails with an error so qodercli's loop recovers instead of
             // deadlocking.
-            result = await new Promise<{ text: string, isError: boolean }>(resolve => {
+            result = await new Promise<ToolResultPayload>(resolve => {
               const timer = setTimeout(() => {
                 this.parked.delete(key)
                 resolve({
-                  text: `宿主在 ${TOOL_RESULT_TIMEOUT_MS / 1000}s 内未返回工具结果（toolUseId=${key}），本次工具调用已取消`,
+                  content: [{
+                    type: 'text',
+                    text: `宿主在 ${TOOL_RESULT_TIMEOUT_MS / 1000}s 内未返回工具结果（toolUseId=${key}），本次工具调用已取消`,
+                  }],
                   isError: true,
                 })
               }, TOOL_RESULT_TIMEOUT_MS)
@@ -348,7 +392,7 @@ export class QoderSession {
             })
           }
           return {
-            content: [{ type: 'text', text: result.text }],
+            content: result.content,
             ...result.isError ? { isError: true } : {},
           }
         })
@@ -361,19 +405,25 @@ export class QoderSession {
     }
   }
 
-  /** Deliver host tool results to parked/buffered handlers, keyed by callId. */
-  deliverToolResults(tail: readonly Message[]): void {
+  /**
+   * Deliver host tool results to parked or buffered handlers, keyed by call id.
+   * @param tail - the host messages appended since the previous request.
+   * @param images - adapter-resolved request images keyed by attachment id; an
+   *   id missing from the map degrades to handle text.
+   */
+  deliverToolResults(tail: readonly RequestMessage[], images?: ResolvedImages): void {
     let freshUserTurn = false
     for (const message of tail) {
-      if (message.role === 'user' && message.source.kind !== 'tool') {
+      if (message.role === 'user') {
         freshUserTurn = true
         continue
       }
-      if (message.role !== 'user' || message.source.kind !== 'tool') continue
-      const block = message.content[0]
-      if (block === undefined || block.type !== 'tool-result') continue
-      const callId = String(block.toolCallId)
-      const payload = { text: renderResultText(block.content), isError: block.isError === true }
+      if (message.role !== 'tool') continue
+      const callId = String(message.toolCallId)
+      const payload: ToolResultPayload = {
+        content: renderResultContent(message.content, images),
+        isError: message.isError === true,
+      }
       // Key by the qodercli tool-use id the host callId maps to; without a
       // mapping (a call the host never surfaced) fall back to the callId so
       // the entry still buffers for any handler that parked under it.
@@ -391,22 +441,30 @@ export class QoderSession {
     if (freshUserTurn && this.parked.size > 0) {
       const stale = [...this.parked.entries()]
       this.parked.clear()
-      for (const [, resolve] of stale) resolve({ text: '[宿主取消了这次工具执行]', isError: true })
+      for (const [, resolve] of stale) {
+        resolve({ content: [{ type: 'text', text: '[宿主取消了这次工具执行]' }], isError: true })
+      }
     }
   }
 
-  /** Run one inner turn: feed (if any) then pump consumer chunks until finish. */
-  async *stream(options: GenerateOptions, feed: string | null): AsyncGenerator<StreamChunk> {
+  /**
+   * Run one inner turn: feed (if any) then pump consumer chunks until finish.
+   * @param options - the host request (signal; tools already registered).
+   * @param feed - literal text, resolved content blocks (a vision turn), or
+   *   null for a pure tool-result continuation.
+   */
+  async *stream(options: GenerateOptions, feed: string | readonly ChannelContent[] | null): AsyncGenerator<StreamChunk> {
     if (this.queue !== null) throw new LlmError(`qoder session ${this.sessionId} already has a turn in flight`, 'CONFLICT')
     if (this.disposed) throw new LlmError(`qoder session ${this.sessionId} was disposed`, 'TRANSPORT')
     const q = this.ensureStarted()
     this.queue = new TurnQueue()
     this.resetTurnState()
     if (feed !== null) {
-      this.turnInputChars += feed.length
+      const content: ChannelContent[] = typeof feed === 'string' ? [{ type: 'text', text: feed }] : [...feed]
+      this.turnInputChars += contentChars(content)
       this.channel.push({
         type: 'user',
-        message: { role: 'user', content: [{ type: 'text', text: feed }] },
+        message: { role: 'user', content },
         parent_tool_use_id: null,
       })
     }
@@ -414,7 +472,10 @@ export class QoderSession {
     let abortTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
       this.abortPending = true
-      void q.interrupt()
+      // interrupt() rides the same transport a teardown may already have killed
+      // (a host abort racing process shutdown); its rejection must not surface
+      // as an unhandled promise rejection.
+      void q.interrupt().catch(() => undefined)
       // Fallback: end the turn if the inner process does not settle promptly.
       abortTimer = setTimeout(() => this.endTurn({ kind: 'aborted', failure: { message: 'qoder session aborted by host', code: 'ABORTED' } }), 5_000)
     }
@@ -509,9 +570,9 @@ export class QoderSession {
    * @param system - the host system prompt included in this request.
    * @param messages - the full host message list included in this request.
    */
-  recordRequestInput(system: string | undefined, messages: readonly Message[]): void {
+  recordRequestInput(system: string | undefined, messages: readonly RequestMessage[]): void {
     const rendered = renderInitialFeed(system, messages)
-    this.estimatedInputTokens = Math.max(1, Math.ceil(rendered.length / 4))
+    this.estimatedInputTokens = Math.max(1, Math.ceil(feedLength(rendered, IMAGE_ESTIMATED_CHARS) / 4))
   }
 
   private endTurn(reason: FinishReason, usage?: TokenUsage): void {
@@ -560,7 +621,7 @@ export class QoderSession {
             // canUseTool/handler sequence is paired by tool-use id anyway, so
             // skipping them keeps the host transcript consistent.
             if (this.queue === null || this.queue.isClosed) break
-            const callId = `qoder-${++this.callCounter}`
+            const callId = `qoder-${this.callNonce}-${++this.callCounter}`
             if (typeof block.id === 'string' && block.id.length > 0) {
               this.hostCallByToolUse.set(callId, block.id)
             }
@@ -577,7 +638,7 @@ export class QoderSession {
             this.emit({
               type: 'tool-call-delta',
               index: chunkIndex,
-              id: CallId(callId),
+              id: ToolCallId(callId),
               name: this.openTool.name,
               argumentsDelta: '',
             })
@@ -608,7 +669,7 @@ export class QoderSession {
             this.emit({
               type: 'tool-call-delta',
               index: this.openTool.chunkIndex,
-              id: CallId(this.openTool.callId),
+              id: ToolCallId(this.openTool.callId),
               argumentsDelta: delta.partial_json,
             })
           }
@@ -621,7 +682,7 @@ export class QoderSession {
               index: this.openTool.chunkIndex,
               block: {
                 type: 'tool-call',
-                id: CallId(this.openTool.callId),
+                id: ToolCallId(this.openTool.callId),
                 name: this.openTool.name,
                 arguments: this.openTool.arguments,
               },
@@ -689,15 +750,31 @@ export class QoderSession {
   }
 }
 
-/** Render tool-result content blocks into the single text the inner model reads. */
-export function renderResultText(blocks: readonly ContentBlock[]): string {
-  const parts: string[] = []
+/**
+ * Render tool-result content blocks into the MCP content the inner model
+ * reads: text passes through, an image resolves from {@link images} into the
+ * MCP image shape or degrades to the harness's own handle text, and anything
+ * else is serialized.
+ */
+export function renderResultContent(blocks: readonly ContentBlock[], images?: ResolvedImages): McpContent[] {
+  const content: McpContent[] = []
   for (const block of blocks) {
-    if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'image') parts.push('[图片结果]')
-    else parts.push(JSON.stringify(block))
+    if (block.type === 'text') {
+      content.push({ type: 'text', text: block.text })
+    } else if (block.type === 'image') {
+      const resolved = images?.get(String(block.attachment.attachmentId))
+      if (resolved !== undefined) content.push({ type: 'image', data: resolved.data, mimeType: resolved.mediaType })
+      else content.push({ type: 'text', text: textOnlyImageText(block.attachment) })
+    } else {
+      content.push({ type: 'text', text: JSON.stringify(block) })
+    }
   }
-  return parts.join('\n')
+  return content
+}
+
+/** Characters one channel content list is charged at for context accounting. */
+function contentChars(content: readonly ChannelContent[]): number {
+  return content.reduce((total, block) => total + (block.type === 'text' ? block.text.length : IMAGE_ESTIMATED_CHARS), 0)
 }
 
 /** Safely stringify the SDK error payload for turn diagnostics. */
@@ -777,23 +854,30 @@ export class QoderSessionManager {
       },
     })
     const signal = options.signal
-    const onAbort = (): void => { void q.interrupt() }
+    const onAbort = (): void => { void q.interrupt().catch(() => undefined) }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       let text = ''
       let failure: { message: string, code: string } | undefined
-      for await (const message of q) {
-        const msg = message as SdkMessage
-        if (msg.type === 'assistant') {
-          const chunk = (msg.message?.content ?? [])
-            .filter(block => block.type === 'text')
-            .map(block => block.text ?? '')
-            .join('')
-          if (chunk.length > 0) text += chunk
-        } else if (msg.type === 'result' && msg.subtype !== 'success' && msg.subtype !== undefined) {
-          const detail = `${msg.subtype} ${safeErrors(msg.errors)}`
-          failure = { message: `qoder side-channel turn failed: ${detail}`, code: classifyTurnError(detail) }
+      try {
+        for await (const message of q) {
+          const msg = message as SdkMessage
+          if (msg.type === 'assistant') {
+            const chunk = (msg.message?.content ?? [])
+              .filter(block => block.type === 'text')
+              .map(block => block.text ?? '')
+              .join('')
+            if (chunk.length > 0) text += chunk
+          } else if (msg.type === 'result' && msg.subtype !== 'success' && msg.subtype !== undefined) {
+            const detail = `${msg.subtype} ${safeErrors(msg.errors)}`
+            failure = { message: `qoder side-channel turn failed: ${detail}`, code: classifyTurnError(detail) }
+          }
         }
+      } catch (error) {
+        // Abandoning this loop on a host abort runs the iterator's return(),
+        // whose close chain rejects once the child process is already gone;
+        // that is the abort, not a transport failure.
+        if (signal?.aborted !== true) throw error
       }
       if (signal?.aborted === true) {
         yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted by host', code: 'ABORTED' } } }

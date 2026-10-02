@@ -4,8 +4,8 @@
  * pure decision helpers are tested directly.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type { ContentBlock, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
 import {
   QODER_BYOK_PROVIDER, QODER_PROVIDER, QoderAdapter, planContinuation, reasoningInfo,
 } from '../src/adapter.ts'
@@ -37,7 +37,7 @@ function message(role: Message['role'], content: ContentBlock[], overrides: Part
     content,
     source: { kind: 'user' },
     ...overrides,
-  }
+  } as Message
 }
 
 function liveEntry(overrides: Record<string, unknown> = {}) {
@@ -114,9 +114,10 @@ describe('planContinuation', () => {
     const previous = [message('user', [text('a')])]
     const current = [
       ...previous,
-      message('user', [{ type: 'tool-result', toolCallId: CallId('c1'), content: [text('ok')] }], {
-        source: { kind: 'tool', callId: CallId('c1') },
-      }),
+      {
+        id: MessageId('t1'), role: 'tool', content: [text('ok')],
+        source: { kind: 'tool', callId: ToolCallId('c1') }, toolCallId: ToolCallId('c1'),
+      } as RequestMessage,
     ]
     expect(planContinuation(previous, current)).toEqual({ feed: null, rebuild: false })
   })
@@ -166,9 +167,7 @@ describe('QoderAdapter.resolveModel', () => {
     const adapter = new QoderAdapter()
     catalogInstances[0]?.liveModels.mockResolvedValue([liveEntry()])
     const resolved = await adapter.resolveModel(QODER_PROVIDER, 'dmodel')
-    expect(resolved.context?.contextWindow).toBe(200_000)
-    expect(resolved.context?.availableContextWindows).toEqual([200_000, 1_000_000])
-    expect(resolved.context?.defaultContextWindow).toBe(200_000)
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
     expect(resolved.defaultMaxTokens).toBe(64_000)
   })
 
@@ -178,8 +177,7 @@ describe('QoderAdapter.resolveModel', () => {
       liveEntry({ defaultContextWindow: undefined, availableContextWindows: undefined }),
     ])
     const resolved = await adapter.resolveModel(QODER_PROVIDER, 'dmodel')
-    expect(resolved.context?.contextWindow).toBe(1_000_000)
-    expect(resolved.context?.availableContextWindows).toBeUndefined()
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
   })
 
   it('carries reasoning metadata from the live entry', async () => {

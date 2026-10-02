@@ -2,15 +2,26 @@
  * Feed rendering: block, message, and feed composition pure functions.
  */
 import { describe, expect, it } from 'vitest'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
-  renderBlocks, renderIdentityAppend, renderInitialFeed, renderMessage, renderRefreshed,
+  blockParts, currentTurnStart, feedImageRefs, feedLength, feedToText, imageRefs,
+  joinFeeds, renderBlocks, renderIdentityAppend, renderInitialFeed, renderMessage, renderRefreshed,
   renderSystemUpdate, renderUserTurn,
 } from '../src/render.ts'
 
 function text(content: string): ContentBlock {
   return { type: 'text', text: content }
+}
+
+function image(id: string): ImageAttachmentRef {
+  return { attachmentId: id as ImageAttachmentRef['attachmentId'], mediaType: 'image/png', bytes: 3, width: 40, height: 30 }
+}
+
+function imageBlock(id: string): ContentBlock {
+  return { type: 'image', attachment: image(id) }
 }
 
 function userMessage(content: ContentBlock[], extra: Partial<Message> = {}): Message {
@@ -20,7 +31,7 @@ function userMessage(content: ContentBlock[], extra: Partial<Message> = {}): Mes
     content,
     source: { kind: 'user' },
     ...extra,
-  }
+  } as Message
 }
 
 describe('renderBlocks', () => {
@@ -32,18 +43,18 @@ describe('renderBlocks', () => {
     expect(renderBlocks([text('a'), { type: 'reasoning', text: 'think' }])).toBe('a')
   })
 
-  it('renders image blocks as placeholders', () => {
-    expect(renderBlocks([{ type: 'image', attachment: { attachmentId: 'x', mimeType: 'image/png', byteLength: 1, width: 1, height: 1 } }])).toBe('[图片附件]')
+  it('renders image blocks with the harness handle text', () => {
+    expect(renderBlocks([imageBlock('att-1')])).toBe(textOnlyImageText(image('att-1')))
   })
 
   it('renders tool calls as placeholders', () => {
-    expect(renderBlocks([{ type: 'tool-call', id: CallId('c1'), name: 'read', arguments: '{"path":"a"}' }]))
+    expect(renderBlocks([{ type: 'tool-call', id: ToolCallId('c1'), name: 'read', arguments: '{"path":"a"}' }]))
       .toBe('[调用了工具 read({"path":"a"})]')
   })
 
-  it('renders tool results recursively', () => {
-    expect(renderBlocks([{ type: 'tool-result', toolCallId: CallId('c1'), content: [text('ok')] }]))
-      .toBe('[工具结果 c1] ok')
+  it('renders tool declaration changes', () => {
+    expect(renderBlocks([{ type: 'tool-addition', toolName: 'read' }])).toBe('[工具启用 read]')
+    expect(renderBlocks([{ type: 'tool-removal', toolName: 'read' }])).toBe('[工具停用 read]')
   })
 
   it('serializes unknown blocks as JSON', () => {
@@ -52,15 +63,44 @@ describe('renderBlocks', () => {
 })
 
 describe('renderMessage', () => {
-  it('tags system, user, and assistant roles', () => {
-    const system = userMessage([text('s')], { role: 'system', source: { kind: 'plugin', plugin: 'test' } })
+  it('tags every role of the closed role map', () => {
+    const system: RequestMessage = {
+      id: MessageId('s'), role: 'system', content: [text('s')], source: { kind: 'system-prompt' },
+    }
     const assistant = userMessage([text('a')], {
       role: 'assistant',
       source: { kind: 'model', provider: 'qoder', model: 'dmodel' },
     })
+    const tool: RequestMessage = {
+      id: MessageId('t'), role: 'tool', content: [text('out')],
+      source: { kind: 'tool', callId: ToolCallId('c1') }, toolCallId: ToolCallId('c1'),
+    }
+    const developer: RequestMessage = {
+      id: MessageId('d'), role: 'developer', content: [{ type: 'tool-addition', toolName: 'read' }],
+      source: { kind: 'user' },
+    }
     expect(renderMessage(system)).toBe('[系统提示] s')
     expect(renderMessage(userMessage([text('u')]))).toBe('[用户] u')
     expect(renderMessage(assistant)).toBe('[助手] a')
+    expect(renderMessage(developer)).toBe('[开发者] [工具启用 read]')
+    expect(renderMessage(tool)).toBe('[工具结果] out')
+  })
+
+  it('reads a request-only user input like a user message', () => {
+    expect(renderMessage({ role: 'user', content: [text('now')] })).toBe('[用户] now')
+  })
+})
+
+describe('currentTurnStart', () => {
+  it('is the whole list while no assistant reply exists', () => {
+    expect(currentTurnStart([userMessage([text('hi')])])).toBe(0)
+    expect(currentTurnStart([])).toBe(0)
+  })
+
+  it('starts after the last assistant reply', () => {
+    const assistant = userMessage([text('a')], { role: 'assistant', source: { kind: 'model', provider: 'qoder', model: 'm' } })
+    const messages = [userMessage([text('u1')]), assistant, userMessage([text('u2')])]
+    expect(currentTurnStart(messages)).toBe(2)
   })
 })
 
@@ -80,11 +120,41 @@ describe('renderInitialFeed', () => {
     const feed = renderInitialFeed(undefined, [userMessage([text('hi')])])
     expect(feed).toContain('---- 宿主对话记录 ----\n[用户] hi')
   })
+
+  it('keeps a current-turn image as a part and its history as handle text', () => {
+    const assistant = userMessage([text('a')], {
+      role: 'assistant', source: { kind: 'model', provider: 'qoder', model: 'm' },
+    })
+    const feed = renderInitialFeed(undefined, [
+      userMessage([imageBlock('old')]),
+      assistant,
+      userMessage([text('look'), imageBlock('new')]),
+    ])
+    expect(Array.isArray(feed)).toBe(true)
+    expect(feedToText(feed)).toContain(textOnlyImageText(image('old')))
+    expect(feedImageRefs(feed).map(ref => String(ref.attachmentId))).toEqual(['new'])
+  })
+
+  it('stays a plain string when the image is only history', () => {
+    const assistant = userMessage([text('a')], {
+      role: 'assistant', source: { kind: 'model', provider: 'qoder', model: 'm' },
+    })
+    const feed = renderInitialFeed(undefined, [userMessage([imageBlock('old')]), assistant, userMessage([text('next')])])
+    expect(typeof feed).toBe('string')
+    expect(feed).toContain(textOnlyImageText(image('old')))
+  })
 })
 
 describe('turn rendering', () => {
   it('renders a brand-new user turn', () => {
     expect(renderUserTurn([text('hi')])).toBe('[用户] hi')
+  })
+
+  it('keeps image occurrences as parts', () => {
+    expect(renderUserTurn([text('look'), imageBlock('a1')])).toEqual([
+      { type: 'text', text: '[用户] look' },
+      { type: 'image', attachment: image('a1') },
+    ])
   })
 
   it('marks an in-place refresh', () => {
@@ -93,6 +163,38 @@ describe('turn rendering', () => {
 
   it('marks a mid-session system update', () => {
     expect(renderSystemUpdate('new rules')).toBe('[系统提示(更新)] new rules')
+  })
+})
+
+describe('feed composition', () => {
+  it('joins text sections with a blank line', () => {
+    expect(joinFeeds(['a', '', 'b'])).toBe('a\n\nb')
+  })
+
+  it('turns the whole feed into parts once one section carries an image', () => {
+    expect(joinFeeds(['a', [{ type: 'text', text: 'b' }, { type: 'image', attachment: image('i1') }], 'c'])).toEqual([
+      { type: 'text', text: 'a\n\nb' },
+      { type: 'image', attachment: image('i1') },
+      { type: 'text', text: 'c' },
+    ])
+  })
+
+  it('splits blocks into parts in block order', () => {
+    expect(blockParts([text('look'), imageBlock('i1'), text('here')])).toEqual([
+      { type: 'text', text: 'look' },
+      { type: 'image', attachment: image('i1') },
+      { type: 'text', text: 'here' },
+    ])
+    expect(imageRefs([text('t'), imageBlock('i2')])).toHaveLength(1)
+  })
+
+  it('charges images a fixed character budget when estimating', () => {
+    const feed: ReturnType<typeof blockParts> = [
+      { type: 'text', text: 'abc' },
+      { type: 'image', attachment: image('i1') },
+    ]
+    expect(feedLength('abc', 100)).toBe(3)
+    expect(feedLength(feed, 100)).toBe(103)
   })
 })
 

@@ -7,13 +7,21 @@
  * @module dsh-llm-qoder/catalog
  */
 
+import type { ModelSource } from '@qoder-ai/qoder-agent-sdk'
+
 /** One Qoder CLI model entry. */
 export interface QoderCatalogModel {
   id: string
   name: string
   description?: string
-  /** Where the model came from: `user` marks a qodercli custom model. */
-  source?: 'system' | 'user'
+  /** Where the model came from: `user` and `custom` mark account-added models. */
+  source?: ModelSource
+  /**
+   * Whether the CLI reports vision input for this model. Only a live catalog
+   * entry can carry it: the static fallback below declares no capability it
+   * could not verify, so an unreachable CLI never advertises image input.
+   */
+  isVl?: boolean
 }
 
 /** Default combined context capacity assumed for Qoder-backed models. */

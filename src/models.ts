@@ -54,6 +54,9 @@ export class QoderModelCatalog {
       name: model.displayName.length > 0 ? model.displayName : model.value,
       ...model.description.length > 0 ? { description: model.description } : {},
       ...model.source === undefined ? {} : { source: model.source },
+      // Carry only a verified affirmative: a false or absent flag stays off the
+      // entry, so a non-VL live model and the static fallback look identical.
+      ...model.isVl === true ? { isVl: true } : {},
     }))
   }
 

@@ -8,12 +8,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm'
-import { CallId, MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import type { ContentBlock, GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { renderInitialFeed } from '../src/render.ts'
+import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
   QoderSession, QoderSessionManager, classifyTurnError, gateTools, hostToolName,
-  renderResultText, safeErrors,
+  renderResultContent, safeErrors,
 } from '../src/session.ts'
 
 const { mockQueryFactory, mockMcpServer } = vi.hoisted(() => {
@@ -49,7 +51,7 @@ class FakeQuery {
   private readonly queue: SdkFrame[] = []
   private resolveNext: ((result: IteratorResult<SdkFrame>) => void) | null = null
   private ended = false
-  readonly interrupt = vi.fn()
+  readonly interrupt = vi.fn(async () => undefined)
   readonly close = vi.fn(async () => undefined)
   options: Record<string, unknown> = {}
 
@@ -137,11 +139,20 @@ function resultFrame(subtype: string | undefined, extra: Record<string, unknown>
 function toolResultMessage(callId: string, text: string): Message {
   return {
     id: MessageId('m1'),
-    role: 'user',
-    source: { kind: 'tool', callId: CallId(callId) },
-    content: [{ type: 'tool-result', toolCallId: CallId(callId), content: [{ type: 'text', text }] }],
+    role: 'tool',
+    source: { kind: 'tool', callId: ToolCallId(callId) },
+    toolCallId: ToolCallId(callId),
+    content: [{ type: 'text', text }],
   }
 }
+
+function imageRef(id: string): ImageAttachmentRef {
+  return {
+    attachmentId: id as ImageAttachmentRef['attachmentId'],
+    mediaType: 'image/png', bytes: 3, width: 40, height: 30,
+  }
+}
+
 
 function userMessage(text: string): Message {
   return { id: MessageId('m1'), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }
@@ -216,17 +227,26 @@ describe('classifyTurnError', () => {
   })
 })
 
-describe('renderResultText', () => {
-  it('joins text blocks with newlines', () => {
-    expect(renderResultText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])).toBe('a\nb')
+describe('renderResultContent', () => {
+  it('keeps each text block as its own MCP content entry', () => {
+    expect(renderResultContent([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]))
+      .toEqual([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])
   })
 
-  it('renders image blocks as a placeholder', () => {
-    expect(renderResultText([{ type: 'image' } as ContentBlock])).toBe('[图片结果]')
+  it('renders an unresolved image as the harness handle text', () => {
+    expect(renderResultContent([{ type: 'image', attachment: imageRef('a1') } as ContentBlock]))
+      .toEqual([{ type: 'text', text: textOnlyImageText(imageRef('a1') as never) }])
   })
 
-  it('serializes other blocks as JSON', () => {
-    expect(renderResultText([{ type: 'reasoning', text: 'think' }])).toBe('{"type":"reasoning","text":"think"}')
+  it('emits MCP image content for adapter-resolved bytes', () => {
+    const images = new Map([['a1', { data: 'QUJD', mediaType: 'image/png' }]])
+    expect(renderResultContent([{ type: 'image', attachment: imageRef('a1') } as ContentBlock], images))
+      .toEqual([{ type: 'image', data: 'QUJD', mimeType: 'image/png' }])
+  })
+
+  it('serializes other blocks as JSON text', () => {
+    expect(renderResultContent([{ type: 'reasoning', text: 'think' }]))
+      .toEqual([{ type: 'text', text: '{"type":"reasoning","text":"think"}' }])
   })
 })
 
@@ -300,12 +320,14 @@ describe('QoderSession.stream synthesis', () => {
     q.push(resultFrame('success'))
     const chunks = await pending
     expect(chunks[0]).toEqual({ type: 'block-start', index: 0, blockType: 'tool-call' })
-    expect(chunks[1]).toMatchObject({ type: 'tool-call-delta', id: CallId('qoder-1'), name: 'read_file', argumentsDelta: '' })
+    const callId = (chunks[1] as Extract<StreamChunk, { type: 'tool-call-delta' }>).id
+    expect(String(callId)).toMatch(/^qoder-[0-9a-f]{8}-1$/)
+    expect(chunks[1]).toMatchObject({ type: 'tool-call-delta', id: callId, name: 'read_file', argumentsDelta: '' })
     expect(chunks[2]).toMatchObject({ type: 'tool-call-delta', argumentsDelta: '{"path":"/x"}' })
     expect(chunks[3]).toEqual({
       type: 'block-end',
       index: 0,
-      block: { type: 'tool-call', id: CallId('qoder-1'), name: 'read_file', arguments: '{"path":"/x"}' },
+      block: { type: 'tool-call', id: callId, name: 'read_file', arguments: '{"path":"/x"}' },
     })
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
   })
@@ -319,10 +341,13 @@ describe('QoderSession.stream synthesis', () => {
     q.push(resultFrame('success'))
     const chunks = await pending
     const ended = chunks.find(chunk => chunk.type === 'block-end')
+    const callId = (chunks.find(chunk => chunk.type === 'tool-call-delta') as
+      Extract<StreamChunk, { type: 'tool-call-delta' }>).id
+    expect(String(callId)).toMatch(/^qoder-[0-9a-f]{8}-1$/)
     expect(ended).toEqual({
       type: 'block-end',
       index: 0,
-      block: { type: 'tool-call', id: CallId('qoder-1'), name: 'read_file', arguments: '{"path":"/x"}' },
+      block: { type: 'tool-call', id: callId, name: 'read_file', arguments: '{"path":"/x"}' },
     })
   })
 

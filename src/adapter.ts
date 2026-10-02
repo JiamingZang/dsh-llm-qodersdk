@@ -10,14 +10,28 @@
 
 import { LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
-  GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
+  GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmResolvedModelInfo,
+  PreparedAdapterCall, RequestMessage, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
   DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, QODER_MODELS, resolveQoderModelId,
 } from './catalog.ts'
 import { DEFAULT_MODEL_CACHE_TTL_MS, QoderModelCatalog } from './models.ts'
-import { renderInitialFeed, renderRefreshed, renderUserTurn } from './render.ts'
+import { feedImageRefs, feedToText, imageRefs, joinFeeds, renderInitialFeed, renderRefreshed, renderUserTurn } from './render.ts'
+import type { Feed } from './render.ts'
 import { QoderSession, QoderSessionManager } from './session.ts'
+import type { ChannelContent, ResolvedImages } from './session.ts'
+
+/**
+ * Read one durable image occurrence into the bytes a request sends.
+ * Implemented over `ctx.attachments`; returns undefined when the object is
+ * unreadable, which degrades that one image instead of failing the turn.
+ */
+export type ImageRequestReader = (
+  ref: ImageAttachmentRef,
+  signal?: AbortSignal,
+) => Promise<{ bytes: Uint8Array, mediaType: string } | undefined>
 
 /** Options for {@link QoderAdapter}. */
 export interface QoderAdapterOptions {
@@ -25,6 +39,8 @@ export interface QoderAdapterOptions {
   maxSessions?: number
   /** How long a fetched CLI model catalog stays fresh (default 5 min). */
   modelCacheTtlMs?: number
+  /** Request-image reader; absent → images are never forwarded as pixels. */
+  readImage?: ImageRequestReader
 }
 
 /** The primary provider route (the qoder account's built-in models). */
@@ -32,13 +48,13 @@ export const QODER_PROVIDER = 'qoder'
 /** Secondary route advertising only the account's custom models. */
 export const QODER_BYOK_PROVIDER = 'qoder-byok'
 
-function modelInfo(provider: string, entry: { id: string, name: string, description?: string }): LlmModelInfo {
+function modelInfo(provider: string, entry: { id: string, name: string, description?: string, isVl?: boolean }): LlmModelInfo {
   return {
     provider,
     id: entry.id,
     name: entry.name,
     ...entry.description === undefined ? {} : { description: entry.description },
-    inputModalities: ['text'],
+    inputModalities: entry.isVl === true ? ['text' as const, 'image' as const] : ['text' as const],
   }
 }
 
@@ -85,6 +101,13 @@ export function reasoningInfo(
   }
 }
 
+/** One adapter dispatch generation: the metadata the harness saw, plus what it implies. */
+interface CallGeneration {
+  readonly info: LlmResolvedModelInfo
+  /** Whether the resolved route accepts image input, per that same resolution. */
+  readonly vision: boolean
+}
+
 /**
  * The Qoder-backed adapter. Session continuity, tool parking, and feed
  * planning live here; chunk synthesis lives in the session's consumer.
@@ -92,11 +115,13 @@ export function reasoningInfo(
 export class QoderAdapter extends LlmAdapter {
   private readonly sessions: QoderSessionManager
   private readonly catalog: QoderModelCatalog
+  private readonly readImage: ImageRequestReader | undefined
 
   constructor(options: QoderAdapterOptions = {}) {
     super()
     this.sessions = new QoderSessionManager(options.maxSessions ?? 8)
     this.catalog = new QoderModelCatalog(options.modelCacheTtlMs ?? DEFAULT_MODEL_CACHE_TTL_MS)
+    this.readImage = options.readImage
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -111,13 +136,13 @@ export class QoderAdapter extends LlmAdapter {
     if (provider === QODER_BYOK_PROVIDER) {
       // Only the account's custom models, which have their own route.
       return cliModels
-        .filter(entry => entry.source === 'user')
+        .filter(entry => entry.source === 'user' || entry.source === 'custom')
         .map(entry => modelInfo(provider, entry))
     }
     // The built-in route lists the qoder account's own models, excluding the
     // custom models that have their own route.
     return cliModels
-      .filter(entry => entry.source !== 'user')
+      .filter(entry => entry.source !== 'user' && entry.source !== 'custom')
       .map(entry => modelInfo(provider, entry))
   }
 
@@ -134,24 +159,19 @@ export class QoderAdapter extends LlmAdapter {
         id: live.value,
         name: live.displayName.length > 0 ? live.displayName : live.value,
         ...live.description.length > 0 ? { description: live.description } : {},
-        inputModalities: ['text' as const],
+        // Only an affirmative CLI `isVl` declares image input. The harness
+        // projects images to handle text for a route that omits it, so a claim
+        // the CLI did not make would silently drop pixels; the reverse error
+        // would send pixels to a model that cannot read them.
+        inputModalities: live.isVl === true ? ['text' as const, 'image' as const] : ['text' as const],
         context: {
           // The compaction engine and context meter price against the window
           // a request actually uses. qodercli reports maxInputTokens as the
           // model's CEILING (often 1M) while defaultContextWindow is the
           // effective per-session window (e.g. 200K); using the ceiling would
           // push the auto-compaction threshold far past what the provider
-          // accepts. Prefer the default window, keeping the ceiling visible
-          // through availableContextWindows.
-          contextWindow: live.defaultContextWindow
-            ?? live.maxInputTokens
-            ?? DEFAULT_CONTEXT_WINDOW,
-          ...live.availableContextWindows !== undefined && live.availableContextWindows.length > 0
-            ? { availableContextWindows: live.availableContextWindows }
-            : {},
-          ...live.defaultContextWindow !== undefined
-            ? { defaultContextWindow: live.defaultContextWindow }
-            : {},
+          // accepts, and past what the inner session actually runs with.
+          contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW,
         },
         defaultMaxTokens: live.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
         ...reasoning === undefined ? {} : { reasoning },
@@ -169,10 +189,35 @@ export class QoderAdapter extends LlmAdapter {
     })
   }
 
+  /**
+   * Bind one resolution generation to its dispatch, as the seam requires of a
+   * dynamic adapter: the live catalog and the CLI login can change between the
+   * harness preparing a call and the inner session running it, and a turn must
+   * not mix one generation's declared capabilities with another's endpoint.
+   */
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    const generation = await this.capture(provider, model, signal)
+    return {
+      model: generation.info,
+      stream: options => this.dispatch(options, generation),
+    }
+  }
+
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    yield* this.dispatch(options, await this.capture(options.provider, options.model, options.signal))
+  }
+
+  /** Resolve the exact route once and derive the capability facts from it. */
+  private async capture(provider: string, model: string, signal?: AbortSignal): Promise<CallGeneration> {
+    const info = await this.resolveModel(provider, model, signal)
+    return { info, vision: info.inputModalities?.includes('image') === true }
+  }
+
+  private async *dispatch(options: GenerateOptions, generation: CallGeneration): AsyncGenerator<StreamChunk> {
     const model = resolveQoderModelId(options.model)
     if (options.sessionId === undefined || options.purpose !== undefined) {
-      const prompt = renderInitialFeed(options.system, options.messages)
+      // Side channels summarise text; pixels would only cost them context.
+      const prompt = feedToText(renderInitialFeed(options.system, options.messages))
         + '\n（这是一次性旁路请求，直接输出下一条助手回复。）'
       // Side channels (titles, compaction summaries) reuse the main session's
       // model so dsh's recorded summarization target matches what qodercli
@@ -182,21 +227,24 @@ export class QoderAdapter extends LlmAdapter {
       return
     }
     const sessionId = String(options.sessionId)
+    // The seam carries no per-request context window: the route's capacity
+    // comes from resolveModel, and the inner session uses the CLI's own window.
     const policy = {
       ...options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort },
-      ...options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow },
     }
     let session = this.sessions.forSession(sessionId, model)
     if (session.fedMessages === undefined) {
-      yield* this.firstTurn(session, options, model, policy)
+      yield* this.firstTurn(session, options, model, policy, generation.vision)
       return
     }
-    session.deliverToolResults(options.messages.slice(session.fedMessages.length))
+    const tail = options.messages.slice(session.fedMessages.length)
+    const images = await this.resolveTurnImages(tail, generation.vision, options.signal)
+    session.deliverToolResults(tail, images)
     const plan = planContinuation(session.fedMessages, options.messages)
     if (plan.rebuild) {
       this.sessions.dispose(sessionId)
       session = this.sessions.forSession(sessionId, model)
-      yield* this.firstTurn(session, options, model, policy)
+      yield* this.firstTurn(session, options, model, policy, generation.vision)
       return
     }
     session.setModel(model, policy)
@@ -204,14 +252,15 @@ export class QoderAdapter extends LlmAdapter {
     session.recordRequestInput(options.system, options.messages)
     session.fedMessages = options.messages
     session.fedSystem = options.system
-    yield* session.stream(options, plan.feed)
+    yield* session.stream(options, plan.feed === null ? null : await this.buildFeed(plan.feed, generation.vision, images))
   }
 
   private async *firstTurn(
     session: QoderSession,
     options: GenerateOptions,
     model: string,
-    policy: { reasoningEffort?: string, contextWindow?: number },
+    policy: { reasoningEffort?: string },
+    vision: boolean,
   ): AsyncGenerator<StreamChunk> {
     session.setModel(model, policy)
     session.setSystem(options.system)
@@ -223,18 +272,88 @@ export class QoderAdapter extends LlmAdapter {
     session.recordRequestInput(options.system, options.messages)
     session.fedMessages = options.messages
     session.fedSystem = options.system
-    yield* session.stream(options, renderInitialFeed(options.system, options.messages))
+    const feed = renderInitialFeed(options.system, options.messages)
+    const images = await this.resolveImages(feedImageRefs(feed), vision, options.signal)
+    yield* session.stream(options, await this.buildFeed(feed, vision, images))
   }
 
-/** Tear down every warm inner session (plugin dispose). */
+  /** Image references carried by a message tail, skipping assistant content. */
+  private async resolveTurnImages(
+    tail: readonly RequestMessage[],
+    vision: boolean,
+    signal?: AbortSignal,
+  ): Promise<ResolvedImages> {
+    const refs = tail.flatMap(message => message.role === 'assistant' ? [] : imageRefs(message.content))
+    return this.resolveImages(refs, vision, signal)
+  }
+
+  /** Resolve image references into base64 request bytes; absent reader → none. */
+  private async resolveImages(
+    refs: readonly ImageAttachmentRef[],
+    vision: boolean,
+    signal?: AbortSignal,
+  ): Promise<ResolvedImages> {
+    const map = new Map<string, { data: string, mediaType: string }>()
+    if (!vision || this.readImage === undefined || refs.length === 0) return map
+    for (const ref of refs) {
+      const key = String(ref.attachmentId)
+      if (map.has(key)) continue
+      try {
+        const image = await this.readImage(ref, signal)
+        if (image !== undefined) {
+          map.set(key, { data: Buffer.from(image.bytes).toString('base64'), mediaType: image.mediaType })
+        }
+      } catch {
+        // One unreadable attachment degrades to handle text; the turn continues.
+      }
+    }
+    return map
+  }
+
+  /**
+   * Turn a feed into channel content. A text feed passes through; a non-vision
+   * feed flattens to the harness's own image handle text; an image the host
+   * could not read keeps a note naming what was dropped, so the inner model
+   * still knows the attachment was there.
+   */
+  private async buildFeed(
+    feed: Feed,
+    vision: boolean,
+    images: ResolvedImages,
+  ): Promise<string | ChannelContent[]> {
+    if (typeof feed === 'string') return feed
+    if (!vision) return feedToText(feed)
+    const content: ChannelContent[] = []
+    let pixels = 0
+    for (const part of feed) {
+      if (part.type === 'text') {
+        if (part.text.length > 0) content.push({ type: 'text', text: part.text })
+        continue
+      }
+      const resolved = images.get(String(part.attachment.attachmentId))
+      if (resolved === undefined) {
+        content.push({ type: 'text', text: `[图片附件 ${String(part.attachment.attachmentId)} 本次未能读取，请基于文字内容继续]` })
+        continue
+      }
+      pixels += 1
+      content.push({
+        type: 'image',
+        source: { type: 'base64', media_type: resolved.mediaType, data: resolved.data },
+      })
+    }
+    // Nothing to show as pixels: stay in the historical single-string shape.
+    return pixels === 0 ? content.map(block => block.type === 'text' ? block.text : '').join('\n\n') : content
+  }
+
+  /** Tear down every warm inner session (plugin dispose). */
   close(): void {
     this.sessions.closeAll()
   }
 }
 
 interface ContinuationPlan {
-  /** Text to feed the inner session this turn, or null for a pure continuation. */
-  feed: string | null
+  /** Feed for the inner session this turn, or null for a pure continuation. */
+  feed: Feed | null
   /** Whether the warm session must be rebuilt (history diverged past repair). */
   rebuild: boolean
 }
@@ -246,7 +365,10 @@ interface ContinuationPlan {
  * turn). Tail tool-result messages were already resolved into parked handlers
  * and never feed; fresh user turns and mutated messages do.
  */
-export function planContinuation(previous: readonly import('@deepseek-ai/dsh-llm').Message[], current: readonly import('@deepseek-ai/dsh-llm').Message[]): ContinuationPlan {
+export function planContinuation(
+  previous: readonly RequestMessage[],
+  current: readonly RequestMessage[],
+): ContinuationPlan {
   if (current.length <= previous.length) return { feed: null, rebuild: true }
   const mutated: number[] = []
   for (let i = 0; i < previous.length; i++) {
@@ -254,13 +376,14 @@ export function planContinuation(previous: readonly import('@deepseek-ai/dsh-llm
   }
   if (mutated.includes(0) || mutated.length > 2) return { feed: null, rebuild: true }
   const tail = current.slice(previous.length)
-  const freshUser = tail.filter(m => m.role === 'user' && m.source.kind !== 'tool')
+  const freshUser = tail.filter(m => m.role === 'user')
   if (freshUser.length === 0 && mutated.length === 0) return { feed: null, rebuild: false }
-  const parts: string[] = []
+  const parts: Feed[] = []
   for (const index of mutated) {
     const message = current[index]
     if (message !== undefined) parts.push(renderRefreshed(message))
   }
   for (const message of freshUser) parts.push(renderUserTurn(message.content))
-  return { feed: parts.join('\n\n'), rebuild: false }
+  const feed = joinFeeds(parts)
+  return { feed: typeof feed === 'string' && feed.length === 0 ? null : feed, rebuild: false }
 }
