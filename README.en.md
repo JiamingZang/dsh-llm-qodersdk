@@ -95,7 +95,7 @@ The qodercli stream `usage` frames (`input_tokens` / `output_tokens`) are zeroed
 
 Adaptation: **estimate each request's input on the plugin side with the same measure the harness front-end token meter uses.**
 
-`adapter.stream()` calls `session.recordRequestInput(system, messages)` on every request, rendering the full conversation (system prompt + all messages) via `renderInitialFeed(system, messages)` and estimating tokens as `rendered.length / 4` — the same `CHARS_PER_TOKEN = 4` convention as harness `estimate.ts`. `usage()` prefers this estimate:
+`adapter.stream()` calls `session.recordRequestInput(system, messages)` on every request, rendering the full conversation (system prompt + all messages) via `renderInitialFeed(system, messages)`, estimating text tokens as `characters / 4` — the same `CHARS_PER_TOKEN = 4` convention as harness `estimate.ts` — while each image forwarded this round adds `width x height / 750` tile tokens. `usage()` prefers this estimate:
 
 ```ts
 if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
@@ -104,6 +104,8 @@ if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
 ```
 
 The UI context ring, auto-compaction threshold, and the plugin-reported values thus **share one estimation convention**: occupancy display and compaction behavior agree, with no "UI shows 2% while actually near the limit" split.
+
+**Image metering is an estimate, not provider data**: qodercli reports no usage for vision payloads, and the plugin declares neither `imageRequestPricing` nor an image budget, since there is no trustworthy per-model visual-token price to fill in. The tile formula therefore only keeps the context ring and the compaction threshold from under-counting; the `IMAGE_OFFLOAD_REQUIRED` budget-driven per-image offload path never fires on the `qoder` route, and image-heavy overflow surfaces as an inner error.
 
 ### 7. Error classification adaptation
 

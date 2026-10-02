@@ -95,7 +95,7 @@ qodercli 的流事件 `usage` 帧（`input_tokens` / `output_tokens`）默认全
 
 适配方式：**在插件侧按 harness 前端 token-meter 相同的口径估算每次请求的输入**。
 
-`adapter.stream()` 每次请求调用 `session.recordRequestInput(system, messages)`，用 `renderInitialFeed(system, messages)` 渲染完整会话（系统提示 + 全部消息），按 `rendered.length / 4` 估算 token —— 与 harness `estimate.ts` 的 `CHARS_PER_TOKEN = 4` 同口径。`usage()` 优先返回该估算值：
+`adapter.stream()` 每次请求调用 `session.recordRequestInput(system, messages)`，用 `renderInitialFeed(system, messages)` 渲染完整会话（系统提示 + 全部消息），文本按 `字符数 / 4` 估算 token（与 harness `estimate.ts` 的 `CHARS_PER_TOKEN = 4` 同口径），本轮转发的图片另按 tile 面积 `width × height / 750` 追加。`usage()` 优先返回该估算值：
 
 ```ts
 if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
@@ -104,6 +104,8 @@ if (this.estimatedInputTokens !== undefined && this.estimatedInputTokens > 0) {
 ```
 
 这样 UI 上下文环、自动压缩阈值与插件上报值**使用同一套估算口径**，占用显示与压缩行为一致，不会出现"UI 显示 2% 而实际已接近上限"的割裂。
+
+**图片计量是估算，不是服务商数据**：qodercli 不对视觉负载上报 usage，插件也未声明 `imageRequestPricing` / 图片预算（没有可信的每模型视觉 token 单价可填）。因此 tile 公式只用于让上下文环与压缩阈值不低估占用；`IMAGE_OFFLOAD_REQUIRED` 那套按预算逐张卸载的恢复路径在 `qoder` 路由上不会触发，图片过多导致的失败以内层报错的形式出现。
 
 ### 7. 错误分类适配
 
