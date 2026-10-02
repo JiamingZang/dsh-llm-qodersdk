@@ -1,6 +1,6 @@
 # dsh-llm-qodersdk
 
-> **中文** | [English](README.en.md)
+> [中文](README.md) | **English**
 
 An adapter plugin (`@jiamingzang/dsh-llm-qoder`) that routes DeepSeek Harness's LLM seam (`ctx.llm`) to the local **Qoder CLI**, built on [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk).
 
@@ -13,7 +13,9 @@ It registers the `qoder` / `qoder-byok` provider routes so the harness's model r
 - **Persistent sessions**: one warm inner `query()` subprocess per host session id; conversation continuation and tool rounds all happen inside the session, LRU-evicted by insertion order within the `maxSessions` cap.
 - **Tool bridging**: host tools are exposed to the inner model through an in-process MCP server (`dsh-host`); qodercli executes one call at a time and the host returns the whole round of results, paired by callId (timed out and cancelled if not delivered within 120s).
 - **Model catalog**: fetches available models (including account-custom ones) live from the CLI with TTL caching + shared concurrency + timeout protection, falling back to a static catalog on failure; also provides `deepseek-v4-flash` → `dfmodel` and `deepseek-v4-pro` → `dmodel` aliases.
-- **Reasoning effort & context window**: `resolveModel` reports the CLI's reasoning efforts, default level, and `availableContextWindows` / `defaultContextWindow` so the model selector can switch them; the selected values are sent per-request via the model-policy parameter.
+- **Reasoning effort**: `resolveModel` reports the CLI's reasoning efforts and default level, switchable directly in the model selector; the selected value is sent down to the inner session with every request.
+- **Context window**: `resolveModel` reports only the window the requests actually use (`LlmModelContext` in the current seam has `contextWindow` as its only field), so the compaction threshold and the context ring's denominator stay consistent with the inner real window.
+- **Vision input**: only models the CLI explicitly marks `isVl: true` in the model catalog advertise the `image` modality; for those models, images newly uploaded this round and images inside tool results are forwarded to the inner CLI as base64. Historical images and text-only models still go through the harness placeholder text, so pixels are never re-counted into every request.
 - **Side-channel requests**: titles, compaction summaries, and other side-channel requests use one-shot cold calls that never occupy a warm session.
 - **Overflow recoverable**: when the inner model fails on context overflow (e.g. `maximum context length ... you requested N tokens`), the error is classified as `CONTEXT_WINDOW_EXCEEDED` via dsh-llm's `isContextWindowExceededError`, so the harness's overflow auto-recovery (with `compaction-basic`) takes over instead of wasting the turn.
 
@@ -27,7 +29,7 @@ The harness registers `QoderAdapter` via `ctx.llm.registerAdapter(['qoder', 'qod
 
 | Harness seam | This plugin's implementation |
 | --- | --- |
-| `providerInfo(provider)` | Returns display names for `qoder` (Qoder CLI) / `qoder-byok` (Qoder custom) |
+| `providerInfo(provider)` | Returns the display names for `qoder` (`Qoder CLI`) / `qoder-byok` (`Qoder 自定义`, i.e. Qoder custom) |
 | `listModels(provider)` | Fetches the qodercli model catalog live, filtered by provider (`qoder` → built-in; `qoder-byok` → account-custom `source === 'user'`) |
 | `resolveModel(provider, model)` | Resolves model metadata (context window, reasoning effort, output limit) from the live catalog / static table |
 | `stream(options)` | Turns a `GenerateOptions` into a qodercli `query()` call and streams back `StreamChunk` |
@@ -40,9 +42,9 @@ The core of the adaptation is **`stream()` routing**:
 ### 2. Session model adaptation
 
 - **One host session ↔ one warm qodercli session**: `QoderSessionManager` keys `query()` subprocesses by host `sessionId`; beyond `maxSessions` they are evicted LRU by insertion order.
-- **Incremental feed**: the host sends the full message list on every request; the plugin uses `planContinuation` to diff against the previous one and renders only the new user turns and rewritten messages into a plain-text feed; tool results never enter the text feed (they go over MCP).
+- **Incremental feed**: the host sends the full message list on every request; the plugin uses `planContinuation` to diff against the previous one and renders only the new user turns and rewritten messages into the feed; tool results do not enter the feed (they go over MCP). The feed is plain text by default, and only becomes "text + image" blocks when this round carries images and the model advertises `image`.
 - **Rebuild detection**: when the host surface is rewritten (e.g. compaction folds history) so messages shrink or restructure, `planContinuation` returns `rebuild: true` and the plugin disposes the old warm session and cold-starts from the new surface. **This guarantees dsh-side compaction and qodercli's internal cache never hold duplicate state.**
-- **Model switching**: `setModel` forwards `reasoningEffort` / `contextWindow` to the inner session as model-policy parameters.
+- **Model switching**: `setModel` forwards `reasoningEffort` to the inner session as a model-policy parameter. `GenerateOptions` in the current seam carries no per-request window, so the inner session always runs on the CLI's own default window — the same source as the value `resolveModel` reports.
 
 ### 3. Tool bridging adaptation (MCP)
 
@@ -78,8 +80,14 @@ contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTE
 ```
 
 - Using `defaultContextWindow` (the actual window, e.g. 200K) → threshold = 160K, aligned with the provider's real capacity;
-- `maxInputTokens` (the ceiling, e.g. 1M) stays only in `availableContextWindows` for the selector to switch;
-- If the ceiling were used, the threshold would be inflated (e.g. 800K) and compaction would never fire before the provider rejects the request.
+- If the ceiling were used, the threshold would be inflated (e.g. 800K) and compaction would never fire before the provider rejects the request;
+- `LlmModelContext` in the current seam has `contextWindow` as its only field, so the CLI's optional tiers are no longer shipped with the metadata (the selector cannot switch windows; only the CLI itself decides).
+
+### 4.5 Call-generation binding (`prepareCall`)
+
+The harness first calls `prepareCall(provider, model, signal)` to bind "the model metadata for this one call", and dispatches the streaming request later (`dsh-agent-loop` uses exactly this path). The plugin overrides it to pin the resolved metadata together with the capabilities derived from it (whether it is a vision model) onto the same generation: even if the CLI catalog or the login state changes between prepare and stream, this round never attaches "the previous generation's capabilities" to "the next generation's endpoint".
+
+**This is also the root-cause fix for `registration.adapter.prepareCall is not a function`**: that method is a concrete method added to the `LlmAdapter` base class in dsh-llm 0.1.1-rc.2, so the plugin must be compiled/installed against a dsh-llm that contains it, or it blows up at runtime (see issue #2).
 
 ### 6. Context usage metering adaptation
 
@@ -118,25 +126,51 @@ Provider context overflow thus triggers harness auto-recovery and quota exhausti
 - **No-conflict guarantee**: after dsh compaction rewrites the surface, the plugin's `planContinuation` detects the message structure change (`rebuild: true`) and rebuilds the warm session. qodercli's internal cache is invalidated along with the dsh compaction — **there is never "both sides compacting"**.
 - Summaries default to the main session route; to bypass a specific provider's quota, point compaction-basic's `summarizationProvider` / `summarizationModel` at another model with quota in `cordis.patch.yml`.
 
+## Compatibility
+
+| dsh runtime | Usable | Notes |
+| --- | --- | --- |
+| `0.1.7-rc.1` ~ `0.2.x` | ✅ | This repository is compiled and tested against this seam generation (`@deepseek-ai/dsh-llm`'s `RequestMessage` / `role: 'tool'` tool results / `ToolCallId` / `prepareCall`) |
+| `0.1.1-rc.2` ~ `0.1.2-rc.1` | ❌ | Tool results are still `tool-result` content blocks, the call-id function is still named `CallId`, and `GenerateOptions` has no `contextWindow`; neither the types nor the runtime match |
+| `0.1.0-rc.x` | ❌ | The base class has no `prepareCall`; after selecting a qoder route, the very first message fails with `registration.adapter.prepareCall is not a function` (issue #2) |
+
+The peer range is pinned to `^0.1.7-rc.1 || ^0.2.0-rc.1` rather than a cross-tuple form like `^0.1.0-rc.5`: npm's semver matches prereleases only inside the same `[major,minor,patch]` tuple, so the old range would never resolve to the fixed versions and would also be judged incompatible with the runtime by dsh's profile installer, which then refuses the install.
+
 ## Installation
 
 Prerequisites: a local `qodercli` binary with an active login (`qodercli --version` runs). The plugin fully reuses the qodercli login state — no API key or settings section needed.
 
-### From the release tarball
+### Channel 1: direct from Git (no local build needed)
 
-1. Get the package: download the latest `jiamingzang-dsh-llm-qoder-<version>.tgz` from this repository's Releases (or produce it yourself with `pnpm pack` in the repo root);
-2. Add it to the target profile:
+```sh
+dsh plugin --profile <profile> add git+https://github.com/JiamingZang/dsh-llm-qodersdk.git
+```
 
-   ```sh
-   dsh plugin --profile <profile> add jiamingzang-dsh-llm-qoder-<version>.tgz
-   ```
+The repository **commits the build artifacts** — `lib/index.js` and `lib/types/*.d.ts` — so this path does not need pnpm to run the plugin's own `prepare` script (on newer pnpm, an unapproved `prepare` hard-fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` instead of being silently skipped).
 
-3. **First install requires approving a build script**: `@qoder-ai/qoder-agent-sdk` ships a postinstall (downloads the worker runtime), which pnpm 11+ blocks by default with `ERR_PNPM_IGNORED_BUILDS`. dsh writes the pending key into the profile's `pnpm-workspace.yaml` placeholder (`'@qoder-ai/qoder-agent-sdk': set this to true or false` under `allowBuilds`); set it to `true` and rerun the add command to finish — this is dsh's standard fail-loud flow for any dependency with postinstall scripts;
-4. Verify: `dsh --profile <profile> --dump-config | grep llm-qoder` shows the plugin entry; after restarting the service, the model selector offers `qoder` / `qoder-byok`.
+If the install prints `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: @qoder-ai/qoder-agent-sdk`, **you can ignore it for now**: the published SDK's default runtime is Worker, and its postinstall does not download the `qodercli` binary in the first place (see `scripts/postinstall.cjs`); tested in practice, the plugin still loads and starts the inner session normally with the build script skipped. Approve it only when one of the following applies:
 
-### Manual mount (optional)
+- your environment cannot run the Worker runtime and you need the in-process CLI fallback: change the corresponding key under `allowBuilds` in the profile `~/.dsh/profiles/<profile>/pnpm-workspace.yaml` to `true` and rerun add (or confirm it in the build approval UI of the dsh Web interface) — equivalent to `QODER_INSTALL_BUNDLED_CLI=1`;
+- you want to use your already-installed local `qodercli`: no approval needed, just set `QODERCLI_PATH`.
 
-Without the plugin command, declare it directly in cordis.yml or a patch layer (the plugin's package.json also declares `dsh.bundle`, so plugin add joins it to the profile's bundles automatically):
+There is only one real prerequisite: **the local `qodercli` is logged in**. When it is not, the plugin still registers normally and still sends requests; the turn ends in error and returns `No qodercli login found. Run "qodercli login" first.`
+
+### Channel 2: local package (tgz / directory)
+
+```sh
+dsh plugin --profile <profile> add ./jiamingzang-dsh-llm-qoder-<version>.tgz
+```
+
+The package produced by `pnpm pack` already contains `lib/`, and the install flow is the same as channel 1 (the build script is not required, see above).
+
+### Channel 3: npm
+
+`@jiamingzang/dsh-llm-qoder` is not published to npm yet (`npm view` returns 404). Once published, `dsh plugin add @jiamingzang/dsh-llm-qoder` becomes the least effort path; until then use one of the two channels above.
+
+### Verification & manual mount
+
+- Verify: `dsh --profile <profile> --dump-config | grep llm-qoder` should show the plugin entry; once the service starts, the model selector shows the two groups `Qoder CLI` / `Qoder 自定义` (Qoder custom) (taking >10s on the first start is normal).
+- Without going through the plugin command, declare it directly in cordis.yml or a patch layer (the plugin's package.json also declares `dsh.bundle`, so plugin add joins it to the profile's bundles automatically):
 
 ```yaml
 - id: llm-qoder
@@ -145,19 +179,25 @@ Without the plugin command, declare it directly in cordis.yml or a patch layer (
 
 ### Usage & troubleshooting
 
-- Pick a model under `qoder` (account built-ins) or `qoder-byok` (account custom models) in the dialog model selector or the Models settings page; context window and reasoning effort are switchable in the model panel.
-- **Custom models or the context-window switch gone**: usually the live catalog fetch failed during a qodercli auto-upgrade window or because the account quota ran out (the backend marks models `isEnabled: false`), so the plugin fell back to the static catalog. Failed fetches are not cached; once the CLI recovers, the live catalog returns automatically — no service restart needed.
+- Pick a model under `Qoder CLI` (account built-ins) or `Qoder 自定义` (Qoder custom, account custom models) in the dialog model selector or on the Models settings page; reasoning effort levels can be switched in the model panel.
+- **Custom models not visible**: usually the live catalog fetch failed during a qodercli auto-upgrade window or because the account quota ran out (the server side marks models `isEnabled: false`), so the plugin fell back to the static catalog. Failed fetches are not cached; once the CLI recovers the live catalog comes back automatically — no service restart needed.
+- **Images sent but invisible to the model**: only models the live catalog marks `isVl: true` advertise image input; for the other models the host projects images into placeholder text, and the plugin does not fake vision capability.
+- **Turns ending straight in error**: first check whether it is `No qodercli login found` — the inner session reuses the local qodercli login state, so when you are not logged in the plugin's own registration and catalog are both fine and only the request fails.
 
 ## Configuration
+
+The configuration options are the plugin profile entry's `Config` (the settings page projects that schema directly via dsh-settings; the plugin no longer registers its own namespace):
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `maxSessions` | number | `8` | Max warm inner qodercli sessions kept (beyond this, LRU eviction by insertion order) |
 | `modelCacheTtlSeconds` | number | `300` | Freshness TTL for the CLI model catalog cache |
 
+After a configuration change, the profile loader re-`apply()`s: the new adapter takes over the routes, and the old adapter's warm sessions close along with the effect.
+
 ## Context Management & Compaction
 
-Warm inner sessions accumulate the whole host history: the first turn feeds the full history (`renderInitialFeed`), and each later turn feeds only the increment (new user messages, in-place refreshes). The inner context thus grows with the conversation, up to the model's hard ceiling (e.g. 1048576 tokens).
+Warm inner sessions accumulate the whole host history: the first turn feeds the full history (`renderInitialFeed`), and each later turn feeds only the increment (new user messages, in-place refreshes). The inner context thus grows with the conversation, while the model has a hard ceiling (e.g. 1048576 tokens).
 
 - **Overflow auto-recovery**: when the inner model reports context overflow, the plugin reports `CONTEXT_WINDOW_EXCEEDED`. The harness overflow recovery (`dsh-compaction-basic`'s `agent/request-error` handler) compacts the host history and retries; once the history shrinks, the next request detects the rollback and rebuilds the inner session, cold-feeding the compacted history.
 - **Prerequisite**: the deployment must load `dsh-compaction-basic` (`auto` defaults to `true`) and `dsh-token-meter`. Without a compaction plugin, the overflowing turn still fails — only a new session or manual compaction helps.
@@ -179,29 +219,30 @@ Warm inner sessions accumulate the whole host history: the first turn feeds the 
 
 | File | Responsibility |
 | --- | --- |
-| `src/index.ts` | Plugin entry: `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)` |
-| `src/adapter.ts` | `QoderAdapter`: model listing/resolution/streaming, warm session management, continuation planning, side-channel model pass-through, request input estimation |
-| `src/session.ts` | `QoderSession`: inner `query()` subprocess, MCP tool bridge, SDK stream events → harness `StreamChunk`, usage reporting (input estimation + error classification) |
-| `src/models.ts` | Live model catalog fetch (TTL cache, shared concurrency, timeout, static fallback) |
-| `src/catalog.ts` | Static model table and `deepseek-v4-*` aliases |
-| `src/render.ts` | Host messages → inner plain-text feed; identity override |
+| `src/index.ts` | Plugin entry: `ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)`; soft-depends on the host attachment store via `ctx.inject(['attachments'])` (if it is not mounted, images degrade to placeholder text) |
+| `src/adapter.ts` | `QoderAdapter`: model listing/resolution/streaming, `prepareCall` generation binding, vision-capability determination and image byte resolution, warm session management, continuation planning, side-channel model pass-through, request input estimation |
+| `src/session.ts` | `QoderSession`: inner `query()` subprocess, MCP tool bridge, SDK stream events → harness `StreamChunk`, usage reporting (real input estimation + error classification) |
+| `src/models.ts` | Live model catalog fetch (TTL cache, shared concurrency, timeout, static fallback), also carrying the CLI's `isVl` |
+| `src/catalog.ts` | Static model table and `deepseek-v4-*` aliases (the static table never advertises vision capability) |
+| `src/render.ts` | Host messages → inner feed: plain text, or "text + image reference" parts; identity override |
 | `src/jsonschema.ts` | dsh `ToolSchema.parameters` → zod shape (for MCP tool registration) |
 
 ## Development & Build
 
-This repo stores only source (`src/`) and tests (`tests/`); build artifacts `lib/` (`lib/index.js` + `lib/types/*.d.ts`) are gitignored and generated on demand by the build script.
+The release artifact of this repository is the **build output committed into the repo**: `lib/index.js` (tsdown bundle) and `lib/types/*.d.ts` (tsc declarations). After changing `src/` you must commit `lib/` together with it, otherwise users installing directly from Git still get the old bundle.
 
 ```sh
 pnpm install
-pnpm test        # vitest unit tests
-pnpm run build   # tsc emits lib/types/*.d.ts, tsdown bundles lib/index.js
-pnpm pack        # produces jiamingzang-dsh-llm-qoder-<version>.tgz
-pnpm publish     # prepublishOnly builds first
+pnpm run typecheck   # tsc type check over src + tests (vitest does not type-check)
+pnpm test            # vitest unit tests
+pnpm run build       # tsc emits lib/types/*.d.ts, tsdown bundles lib/index.js
+pnpm pack            # produces jiamingzang-dsh-llm-qoder-<version>.tgz
+pnpm publish         # prepublishOnly builds first
 ```
 
-The build config is in place (`tsconfig.json` + `tsdown.config.ts`); peer dependencies `@deepseek-ai/dsh-llm` and `@deepseek-ai/cordis` stay external.
+`@deepseek-ai/dsh-llm`, `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` stay external in `tsdown.config.ts` and are provided by the runtime profile; `@deepseek-ai/dsh-attachment` appears only in devDependencies to provide types (the attachment store instance comes from the host).
 
-> **Version note**: the peer dependency `@deepseek-ai/dsh-llm@^0.1.0-rc.5` is now resolvable from the public npm registry (currently `0.1.0-rc.6`), so this repo can `pnpm install && pnpm run build` directly. To align exactly with the local version inside the DeepSeek Harness repo (`0.1.0-rc.5`), build inside `plugins/llm-qoder/` there instead (the repo-root `tsc` + `tsdown` produce `lib/`).
+> **Why the dependencies are pinned**: the previously used `^0.1.0-rc.5` could never match `0.1.1-rc.x`/`0.1.7-rc.x` because of semver's prerelease tuple rule, so the plugin compiled against an `LlmAdapter` base class without `prepareCall`; `pnpm update` cannot fix it either — the manifest has to be edited explicitly (issue #2). At the same time, dsh's profile installer compares the peer ranges of `@deepseek-ai/dsh-*` against the runtime version, and a too-narrow range makes it refuse the install outright.
 
 ## License
 

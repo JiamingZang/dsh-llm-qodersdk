@@ -146,13 +146,14 @@ peer 范围写死为 `^0.1.7-rc.1 || ^0.2.0-rc.1`，不用 `^0.1.0-rc.5` 这类�
 dsh plugin --profile <profile> add git+https://github.com/JiamingZang/dsh-llm-qodersdk.git
 ```
 
-仓库里**已提交构建产物** `lib/index.js` 与 `lib/types/*.d.ts`，所以这条路径不需要 pnpm 运行插件自己的 `prepare` 脚本（在新 pnpm 上，未批准的 `prepare` 会直接硬失败 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，而不是安静跳过）。
+仓库里**已提交构建产物** `lib/index.js` 与 `lib/types/*.d.ts`，所以这条路径不需要 pnpm 运行插件自己的 `prepare` 脚本（在新 pnpm 上，未批准的 `prepare` 是硬失败 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，而不是安静跳过）。
 
-仍需批准 **`@qoder-ai/qoder-agent-sdk` 的 postinstall**——它负责下载内层使用的 `qodercli` 二进制，跳过会导致插件加载后无法启动内层会话：
+安装时如果看到 `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: @qoder-ai/qoder-agent-sdk`，**可以先不管**：发布版 SDK 的默认 runtime 是 Worker，它的 postinstall 本来就不下载 `qodercli` 二进制（见 `scripts/postinstall.cjs`），实测"跳过构建脚本"后插件仍能正常加载并发起内层会话。需要下面任一情况时才批准：
 
-- 安装被拦时，按提示把 profile `~/.dsh/profiles/<profile>/pnpm-workspace.yaml` 里 `allowBuilds` 下对应键的值改为 `true`，重跑上面的 add；
-- 也可以在 dsh Web 界面的插件构建审批里点确认；
-- 如果你本机已经有可用的 `qodercli`（或设置了 `QODERCLI_PATH`），可以跳过该下载，但必须自行保证 SDK 找得到可执行文件。
+- 你的环境跑不了 Worker runtime，需要进程内 CLI fallback：把 profile `~/.dsh/profiles/<profile>/pnpm-workspace.yaml` 里 `allowBuilds` 对应键改成 `true` 重跑 add（或在 dsh Web 界面的构建审批里确认），等价于 `QODER_INSTALL_BUNDLED_CLI=1`；
+- 你想用本机已有的 `qodercli`：不用批准，直接设 `QODERCLI_PATH`。
+
+真正的前置条件只有一个：**本机 `qodercli` 已登录**。未登录时插件会正常注册、正常发请求，轮次以错误结束并回传 `No qodercli login found. Run "qodercli login" first.`
 
 ### 渠道二：本地包（tgz / 目录）
 
@@ -160,7 +161,7 @@ dsh plugin --profile <profile> add git+https://github.com/JiamingZang/dsh-llm-qo
 dsh plugin --profile <profile> add ./jiamingzang-dsh-llm-qoder-<version>.tgz
 ```
 
-`pnpm pack` 产出的包已含 `lib/`，与渠道一同样的构建脚本批准流程。
+`pnpm pack` 产出的包已含 `lib/`，安装流程与渠道一相同（构建脚本非必需，见上）。
 
 ### 渠道三：npm
 
@@ -181,7 +182,7 @@ dsh plugin --profile <profile> add ./jiamingzang-dsh-llm-qoder-<version>.tgz
 - 在对话框模型选择器或 Models 设置页选择 `Qoder CLI`（账号内置）或 `Qoder 自定义`（账号自定义）下的模型；思考档位可在模型面板切换。
 - **看不到自定义模型**：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 `isEnabled: false`）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。
 - **图片发过去模型看不到**：只有 live catalog 标记 `isVl: true` 的模型会广告图像输入；其余模型下宿主会把图片投影成占位文本，插件不会伪造视觉能力。
-- **装完但选不到模型**：确认 profile 的 pnpm 构建审批里 `@qoder-ai/qoder-agent-sdk` 为 `true`（其 postinstall 下载内层 CLI），并检查 `qodercli` 可执行。
+- **轮次直接报错结束**：先看是否为 `No qodercli login found`——内层复用本机 qodercli 登录态，未登录时插件本身注册与目录都正常，只有请求会失败。
 
 ## 配置
 
