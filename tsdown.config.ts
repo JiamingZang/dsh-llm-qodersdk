@@ -20,7 +20,6 @@ export default defineConfig({
   external: [
     '@deepseek-ai/cordis',
     '@deepseek-ai/dsh-llm',
-    '@deepseek-ai/dsh-settings',
     '@deepseek-ai/schemastery',
     '@qoder-ai/qoder-agent-sdk',
     'zod',

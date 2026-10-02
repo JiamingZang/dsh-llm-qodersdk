@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm/brand'
-import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import { offloadedImageText, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
@@ -37,6 +37,12 @@ function userMessage(content: ContentBlock[], extra: Partial<Message> = {}): Mes
 describe('renderBlocks', () => {
   it('joins text blocks with newlines', () => {
     expect(renderBlocks([text('a'), text('b')])).toBe('a\nb')
+  })
+
+  it('renders an offloaded image with the offload placeholder', () => {
+    const block = { type: 'image', attachment: image('off1'), offloaded: true } as ContentBlock
+    expect(renderBlocks([block])).toBe(offloadedImageText(image('off1')))
+    expect(imageRefs([block])).toEqual([])
   })
 
   it('skips reasoning blocks', () => {

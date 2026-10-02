@@ -90,7 +90,6 @@ export declare class QoderSession {
     private queue;
     private model;
     private reasoningEffort;
-    private contextWindow;
     private callCounter;
     /**
      * Per-instance suffix for emitted host call ids. Ids must stay unique across
@@ -133,7 +132,6 @@ export declare class QoderSession {
     /** Point the session at a model and its per-request policy. */
     setModel(model: string, policy?: {
         reasoningEffort?: string;
-        contextWindow?: number;
     }): void;
     /** Record the host system prompt; effective only before the process spawns. */
     setSystem(system: string | undefined): void;

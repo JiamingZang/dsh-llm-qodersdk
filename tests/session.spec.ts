@@ -582,6 +582,24 @@ describe('QoderSessionManager.coldStream', () => {
     expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: QUOTA_EXCEEDED_CODE } } })
   })
 
+  it('reports a side-channel failure that followed partial text', async () => {
+    const { manager, q } = makeCold()
+    const generator = manager.coldStream({} as GenerateOptions, 'prompt')
+    const pending = (async (): Promise<StreamChunk[]> => {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of generator) chunks.push(chunk)
+      return chunks
+    })()
+    q.push({ type: 'assistant', message: { content: [{ type: 'text', text: 'half a summary' }] } })
+    q.push(resultFrame('error_max_turns', { errors: 'maximum context length exceeded' }))
+    q.end()
+    const chunks = await pending
+    expect(chunks.at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED' } },
+    })
+  })
+
   it('reports empty side-channel responses', async () => {
     const { manager, q } = makeCold()
     const generator = manager.coldStream({} as GenerateOptions, 'prompt')

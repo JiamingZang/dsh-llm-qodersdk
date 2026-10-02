@@ -24,7 +24,11 @@ export type FeedPart = {
 };
 /** What one inner turn receives: text (the historical shape) or text + images. */
 export type Feed = string | FeedPart[];
-/** Image references in block order. */
+/**
+ * Image references in block order, skipping occurrences the surface already
+ * offloaded: an offload is a durable fact the harness renders as path-bearing
+ * placeholder text on every route, so re-sending those pixels would undo it.
+ */
 export declare function imageRefs(blocks: readonly ContentBlock[]): ImageAttachmentRef[];
 /** Render one content-block list as plain text; non-text blocks get handles. */
 export declare function renderBlocks(blocks: readonly ContentBlock[]): string;

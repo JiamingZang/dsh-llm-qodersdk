@@ -13,7 +13,7 @@
  * @module dsh-llm-qoder/render
  */
 
-import { fileHandleText, textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import { fileHandleText, offloadedImageText, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
@@ -25,11 +25,15 @@ export type FeedPart =
 /** What one inner turn receives: text (the historical shape) or text + images. */
 export type Feed = string | FeedPart[]
 
-/** Image references in block order. */
+/**
+ * Image references in block order, skipping occurrences the surface already
+ * offloaded: an offload is a durable fact the harness renders as path-bearing
+ * placeholder text on every route, so re-sending those pixels would undo it.
+ */
 export function imageRefs(blocks: readonly ContentBlock[]): ImageAttachmentRef[] {
   const refs: ImageAttachmentRef[] = []
   for (const block of blocks) {
-    if (block.type === 'image') refs.push(block.attachment)
+    if (block.type === 'image' && block.offloaded !== true) refs.push(block.attachment)
   }
   return refs
 }
@@ -41,7 +45,7 @@ export function renderBlocks(blocks: readonly ContentBlock[]): string {
     switch (block.type) {
       case 'text': parts.push(block.text); break
       case 'reasoning': break
-      case 'image': parts.push(textOnlyImageText(block.attachment)); break
+      case 'image': parts.push(block.offloaded === true ? offloadedImageText(block.attachment) : textOnlyImageText(block.attachment)); break
       case 'file': parts.push(fileHandleText(block.attachment, undefined)); break
       case 'tool-call': parts.push(`[调用了工具 ${block.name}(${block.arguments})]`); break
       case 'tool-addition': parts.push(`[工具启用 ${block.toolName}]`); break
@@ -114,7 +118,7 @@ export function blockParts(blocks: readonly ContentBlock[]): FeedPart[] {
     pending = []
   }
   for (const block of blocks) {
-    if (block.type === 'image') {
+    if (block.type === 'image' && block.offloaded !== true) {
       flush()
       parts.push({ type: 'image', attachment: block.attachment })
       continue

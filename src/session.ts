@@ -225,7 +225,6 @@ export class QoderSession {
   private queue: TurnQueue | null = null
   private model: string
   private reasoningEffort: string | undefined
-  private contextWindow: number | undefined
   private callCounter = 0
   /**
    * Per-instance suffix for emitted host call ids. Ids must stay unique across
@@ -283,14 +282,7 @@ export class QoderSession {
         includePartialMessages: true,
         resolveModel: () => ({
           model: this.model,
-          ...this.reasoningEffort === undefined && this.contextWindow === undefined
-            ? {}
-            : {
-              parameters: {
-                ...this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort },
-                ...this.contextWindow === undefined ? {} : { contextWindow: this.contextWindow },
-              },
-            },
+          ...this.reasoningEffort === undefined ? {} : { parameters: { reasoningEffort: this.reasoningEffort } },
         }),
         mcpServers: { [MCP_SERVER_NAME]: this.mcp },
         allowedMcpServerNames: [MCP_SERVER_NAME],
@@ -306,13 +298,9 @@ export class QoderSession {
   }
 
   /** Point the session at a model and its per-request policy. */
-  setModel(
-    model: string,
-    policy?: { reasoningEffort?: string, contextWindow?: number },
-  ): void {
+  setModel(model: string, policy?: { reasoningEffort?: string }): void {
     this.model = model
     this.reasoningEffort = policy?.reasoningEffort
-    this.contextWindow = policy?.contextWindow
   }
 
   /** Record the host system prompt; effective only before the process spawns. */
@@ -890,7 +878,10 @@ export class QoderSessionManager {
         yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted by host', code: 'ABORTED' } } }
         return
       }
-      if (failure !== undefined && text.length === 0) {
+      // A turn that failed after producing partial text is still a failure:
+      // reporting it as a stop would hand the harness a truncated summary and
+      // swallow the very overflow the caller needs to recover from.
+      if (failure !== undefined) {
         yield { type: 'finish', reason: { kind: 'error', failure } }
         return
       }

@@ -151,12 +151,17 @@ export class QoderAdapter extends LlmAdapter {
     model: string,
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    const live = (await this.catalog.liveModels()).find(entry => entry.value === model)
+    // The host may address a model by a `deepseek-v4-*` alias or a `qoder-`
+    // prefixed id, while the CLI catalog is keyed by the SDK value. Resolve the
+    // address to find the metadata, but echo the requested id back: the seam
+    // rejects an exact-model result whose id differs from the one asked for.
+    const target = resolveQoderModelId(model)
+    const live = (await this.catalog.liveModels()).find(entry => entry.value === target)
     if (live !== undefined) {
       const reasoning = reasoningInfo(live.efforts, live.defaultEffort, live.isReasoning)
       return {
         provider,
-        id: live.value,
+        id: model,
         name: live.displayName.length > 0 ? live.displayName : live.value,
         ...live.description.length > 0 ? { description: live.description } : {},
         // Only an affirmative CLI `isVl` declares image input. The harness
@@ -177,12 +182,12 @@ export class QoderAdapter extends LlmAdapter {
         ...reasoning === undefined ? {} : { reasoning },
       }
     }
-    const configured = QODER_MODELS.find(entry => entry.id === model)
+    const configured = QODER_MODELS.find(entry => entry.id === target)
     const reasoning = reasoningInfo(undefined, undefined, true)
     return Promise.resolve({
       ...configured === undefined
         ? { provider, id: model, name: model, inputModalities: ['text' as const] }
-        : modelInfo(provider, configured),
+        : { ...modelInfo(provider, configured), id: model },
       context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: DEFAULT_MAX_TOKENS,
       ...reasoning === undefined ? {} : { reasoning },

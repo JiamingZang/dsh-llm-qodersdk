@@ -180,6 +180,18 @@ describe('QoderAdapter.resolveModel', () => {
     expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
   })
 
+  it('resolves an alias address against the live catalog and echoes it back', async () => {
+    const adapter = new QoderAdapter()
+    catalogInstances[0]?.liveModels.mockResolvedValue([liveEntry({ value: 'dfmodel', isVl: true })])
+    const resolved = await adapter.resolveModel(QODER_PROVIDER, 'deepseek-v4-flash')
+    // The seam rejects an exact-model result whose id differs from the request,
+    // so the alias rides back unchanged while the metadata comes from dfmodel.
+    expect(resolved.id).toBe('deepseek-v4-flash')
+    expect(resolved.name).toBe('DeepSeek-V4-Pro')
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
+  })
+
   it('carries reasoning metadata from the live entry', async () => {
     const adapter = new QoderAdapter()
     catalogInstances[0]?.liveModels.mockResolvedValue([liveEntry()])
